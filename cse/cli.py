@@ -7,6 +7,8 @@
     python -m cse report            # show the shadow-portfolio leaderboard
     python -m cse webhook           # run the Helius webhook receiver
     python -m cse pipeline          # discover -> score -> aggregate in one pass
+    python -m cse watch             # live: watch wallets, paper-trade every trade
+    python -m cse run               # discover -> watch -> periodic rescore (6mo)
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ from .db import Database
 from .discovery import TraderDiscovery
 from .models import Trader, Trade
 from .paper import PaperTradingEngine
+from .runner import run_supervisor, run_watch
 from .scoring import apply_scores, score_traders
 
 
@@ -135,6 +138,33 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     return cmd_report(args)
 
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Live ingest: watch the pool and paper-trade every observed swap."""
+    cfg = load_config()
+    db = Database(cfg.db_path)
+    summary = asyncio.run(run_watch(cfg, db, duration=args.duration))
+    print(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """The six-month shape: discover -> watch -> periodic rescore."""
+    cfg = load_config()
+    db = Database(cfg.db_path)
+    summary = asyncio.run(
+        run_supervisor(
+            cfg,
+            db,
+            discover=not args.no_discover,
+            target=args.target,
+            maintenance_hours=args.maintenance_hours,
+            duration=args.duration,
+        )
+    )
+    print(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cse", description="aggregate top on-chain traders")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -163,6 +193,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     add("webhook", cmd_webhook, "run the Helius webhook receiver")
     add("pipeline", cmd_pipeline, "discover -> score -> aggregate")
+
+    w = add("watch", cmd_watch, "live: watch wallets and paper-trade every trade")
+    w.add_argument("--duration", type=float, default=None, help="stop after N seconds")
+
+    rn = add("run", cmd_run, "discover -> watch -> periodic rescore (the 6-month shape)")
+    rn.add_argument("--target", type=int, default=None, help="wallet target (default from config)")
+    rn.add_argument("--no-discover", action="store_true", help="skip discovery, watch the existing pool")
+    rn.add_argument("--maintenance-hours", type=float, default=24.0, help="rescore interval")
+    rn.add_argument("--duration", type=float, default=None, help="stop after N seconds")
     return p
 
 

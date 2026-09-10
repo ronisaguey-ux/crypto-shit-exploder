@@ -83,11 +83,49 @@ class AggregationConfig:
 
 
 @dataclass
+class RpcConfig:
+    """Free/keyless Solana RPC pool used to fetch transactions."""
+
+    #: Extra endpoint URLs to add on top of the built-in keyless ones.
+    endpoints: list[str] = field(default_factory=list)
+    timeout: float = 30.0
+    #: Maximum concurrent in-flight getTransaction calls across the whole pool.
+    concurrency: int = 16
+    #: Requests/second budget for the built-in keyless endpoints.
+    public_rps: float = 3.0
+    public_heavy_rps: float = 2.0
+
+
+@dataclass
+class WatchConfig:
+    """Live `logsSubscribe` watching configuration."""
+
+    #: Each entry: {url, max_connections, subscriptions_per_connection}.
+    ws_endpoints: list[dict] = field(
+        default_factory=lambda: [
+            {
+                "url": "wss://api.mainnet-beta.solana.com",
+                "max_connections": 4,
+                "subscriptions_per_connection": 100,
+            }
+        ]
+    )
+    commitment: str = "confirmed"
+    #: Drop notifications whose logs show no DEX program before spending a fetch.
+    swap_filter: bool = True
+    refresh_seconds: float = 300.0
+    price_ttl_seconds: float = 300.0
+    queue_size: int = 100_000
+
+
+@dataclass
 class Config:
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     paper: PaperConfig = field(default_factory=PaperConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
     aggregation: AggregationConfig = field(default_factory=AggregationConfig)
+    rpc: RpcConfig = field(default_factory=RpcConfig)
+    watch: WatchConfig = field(default_factory=WatchConfig)
     db_path: str = "data/cse.db"
 
     # --- credentials (never logged) ---
@@ -97,6 +135,7 @@ class Config:
     bitquery_api_key: str = ""
     helius_api_key: str = ""
     helius_webhook_secret: str = ""
+    alchemy_api_key: str = ""
 
     def provider_keys(self) -> dict[str, str]:
         return {
@@ -117,6 +156,7 @@ def _apply_env(cfg: Config) -> Config:
         ("BITQUERY_API_KEY", "bitquery_api_key"),
         ("HELIUS_API_KEY", "helius_api_key"),
         ("HELIUS_WEBHOOK_SECRET", "helius_webhook_secret"),
+        ("ALCHEMY_API_KEY", "alchemy_api_key"),
         ("CSE_DB_PATH", "db_path"),
     ):
         val = os.getenv(name)
@@ -162,5 +202,7 @@ def load_config(path: Optional[str | Path] = None) -> Config:
         paper=PaperConfig(**(raw.get("paper") or {})),
         scoring=ScoringConfig(**(raw.get("scoring") or {})),
         aggregation=AggregationConfig(**(raw.get("aggregation") or {})),
+        rpc=RpcConfig(**(raw.get("rpc") or {})),
+        watch=WatchConfig(**(raw.get("watch") or {})),
     )
     return _apply_env(cfg)

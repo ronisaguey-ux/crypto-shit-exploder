@@ -3,7 +3,9 @@
 
 discovery:
   # How many top traders to pull from the leaderboards before paper-trading.
-  target_traders: 2000
+  # 5000 is the free-stack ceiling: a free Helius key allows 5 websocket
+  # connections x 1000 subscriptions.
+  target_traders: 5000
   # Provider priority order. First provider that answers wins; the rest are fallbacks.
   providers: [solanatracker, vybe, birdeye]
   # Leaderboard lookback window in days.
@@ -71,3 +73,38 @@ aggregation:
   dedupe_window_seconds: 60
   # Maximum concurrent open positions in the aggregate portfolio.
   max_open_positions: 20
+
+rpc:
+  # Free/keyless Solana JSON-RPC pool. The built-in endpoints
+  # (api.mainnet-beta.solana.com, solana.drpc.org, onfinality) need no key.
+  # Add extra URLs here if you have them; ALCHEMY_API_KEY / HELIUS_API_KEY in
+  # the environment append their free tiers automatically.
+  endpoints: []
+  timeout: 30.0
+  # Max concurrent in-flight getTransaction calls across the whole pool.
+  concurrency: 16
+  # Requests/second budget for the keyless endpoints. Keep these low: they are
+  # shared public infrastructure and will ban abusers. Measured honest rates:
+  # ~5.7 getTransaction/s across all three (~492k/day). The pool parks any
+  # endpoint that returns 429 and rotates to the next automatically.
+  public_rps: 3.0
+  public_heavy_rps: 2.0
+
+watch:
+  # Each entry: {url, max_connections, subscriptions_per_connection}.
+  # logsSubscribe accepts exactly ONE address per subscription, so wallet
+  # capacity = sum(max_connections * subscriptions_per_connection) per endpoint.
+  # A HELIUS_API_KEY prepends 5 connections x 1000 subs (= 5000 wallets) free.
+  ws_endpoints:
+    - url: wss://api.mainnet-beta.solana.com
+      max_connections: 4
+      subscriptions_per_connection: 100
+  commitment: confirmed
+  # Drop notifications whose logs show no DEX program before spending a fetch.
+  swap_filter: true
+  # How often to reload the tracked-wallet set from the DB (seconds).
+  refresh_seconds: 300.0
+  # Price cache TTL (seconds).
+  price_ttl_seconds: 300.0
+  # Bounded notification queue; oldest are dropped if the consumer falls behind.
+  queue_size: 100000
