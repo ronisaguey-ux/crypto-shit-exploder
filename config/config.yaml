@@ -106,5 +106,18 @@ watch:
   refresh_seconds: 300.0
   # Price cache TTL (seconds).
   price_ttl_seconds: 300.0
-  # Bounded notification queue; oldest are dropped if the consumer falls behind.
+  # In-memory websocket handoff buffer. On overflow the oldest is dropped rather
+  # than blocking the socket — the backfill poller below is what recovers those,
+  # so a dropped notification is delayed, never lost. Watch `ws.dropped` in the
+  # run summary; a non-zero value means the drain is the bottleneck, not the feed.
   queue_size: 100000
+  # Concurrent signature-drain workers. Each fetch is I/O bound on the RPC pool,
+  # so this mostly needs to be >= the pool's total rps to keep it saturated.
+  workers: 4
+  # Treat the feed as failed after this much silence (see guards.StalenessGuard).
+  stale_after_seconds: 300.0
+  # Read real pool reserves/fees out of each transaction (reserves.enrich_trade).
+  # Free — it costs no extra RPC call — so leave it on.
+  enrich: true
+  # Per-trader log tree: trades.jsonl, daily slices, positions, rolling summary.
+  log_dir: logs/traders
