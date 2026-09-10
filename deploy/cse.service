@@ -1,22 +1,22 @@
 [Unit]
 Description=crypto-shit-exploder (free Solana paper-trading tracker)
-Documentation=file://%h/Roni_workspace/crypto-shit-exploder/README.md
+Documentation=file://%h/Roni_workspace/crypto_shit_exploder/README.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Roni_workspace/crypto-shit-exploder
+WorkingDirectory=%h/Roni_workspace/crypto_shit_exploder
 # Optional: free-tier keys live here. The run works with no keys at all.
-EnvironmentFile=-%h/Roni_workspace/crypto-shit-exploder/.env
-ExecStart=%h/Roni_workspace/crypto-shit-exploder/.venv/bin/python -m cse run --target 5000 --maintenance-hours 24
+EnvironmentFile=-%h/Roni_workspace/crypto_shit_exploder/.env
+ExecStart=%h/Roni_workspace/crypto_shit_exploder/.venv/bin/python -m cse run --target 5000 --maintenance-hours 24
 Restart=always
 RestartSec=15
 # Give the supervisor time to flush state and close sockets on stop.
 TimeoutStopSec=30
 KillSignal=SIGINT
-StandardOutput=append:%h/Roni_workspace/crypto-shit-exploder/data/cse.log
-StandardError=append:%h/Roni_workspace/crypto-shit-exploder/data/cse.log
+StandardOutput=append:%h/Roni_workspace/crypto_shit_exploder/data/cse.log
+StandardError=append:%h/Roni_workspace/crypto_shit_exploder/data/cse.log
 
 [Install]
 WantedBy=default.target
