@@ -1,14 +1,21 @@
-"""Live watcher: WebSocket notifications -> transactions -> paper trades.
+"""Live watcher: WebSocket notifications -> durable queue -> paper trades.
 
-This is the ingest path that replaces the Helius webhook. It consumes
-`logsSubscribe` notifications from the sharded pool, fetches each transaction
-over the free RPC pool, decodes the swap with no DEX-specific knowledge, prices
-it, and feeds it through the same paper engine the webhook used — so behaviour
-is identical, just without the paid webhook tier.
+Ingest is deliberately split in two, because the two halves fail differently.
 
-Cost control is the whole design: signatures are deduplicated, non-swap
-notifications are filtered before any fetch, and in-flight `getTransaction`
-calls are capped so a burst cannot drain a free tier's quota.
+**Produce** (fast, must never block): a `logsSubscribe` notification is filtered
+for "does this even look like a swap", then its signature is written to the
+SQLite queue. No network call happens on this path, so a burst, a slow endpoint or
+a reconnect cannot make the feed drop work — the worst case is a longer backlog.
+
+**Consume** (bounded, retrying): workers claim signatures from the queue, fetch
+each transaction, decode the swap with no DEX-specific knowledge, read the real
+pool reserves and real fees out of it, price it, log it per-trader, and run it
+through the paper engine. A failure re-queues the signature with backoff instead
+of losing the trade.
+
+The swap pre-filter is what makes this affordable on free RPC: most of what a
+wallet emits is not a swap, and every notification rejected here is a
+`getTransaction` never spent.
 """
 from __future__ import annotations
 
@@ -21,11 +28,15 @@ from typing import Optional
 from .aggregation import Aggregator
 from .config import Config
 from .db import Database
+from .guards import KillSwitch, StalenessGuard
 from .models import Trade
 from .paper import PaperTradingEngine
 from .prices import PriceOracle
+from .queue import FetchQueue
+from .reserves import enrich_trade
 from .rpc import RpcPool
-from .swapdecode import decode_trades
+from .swapdecode import decode_trades, is_swap_candidate
+from .tradelog import TraderLogger
 from .ws import Notification, SubscriptionPool
 
 log = logging.getLogger("cse.watcher")
@@ -34,26 +45,34 @@ log = logging.getLogger("cse.watcher")
 @dataclass
 class WatchStats:
     notifications: int = 0
+    filtered: int = 0
+    queued: int = 0
     fetched: int = 0
     not_found: int = 0
     fetch_errors: int = 0
     decoded: int = 0
     trades: int = 0
+    duplicates: int = 0
     closed: int = 0
     signals: int = 0
-    duplicates: int = 0
+    exact_fills: int = 0
+    estimated_fills: int = 0
 
     def as_dict(self) -> dict:
         return {
             "notifications": self.notifications,
+            "filtered": self.filtered,
+            "queued": self.queued,
             "fetched": self.fetched,
             "not_found": self.not_found,
             "fetch_errors": self.fetch_errors,
             "decoded": self.decoded,
             "trades": self.trades,
+            "duplicates": self.duplicates,
             "closed": self.closed,
             "signals": self.signals,
-            "duplicates": self.duplicates,
+            "exact_fills": self.exact_fills,
+            "estimated_fills": self.estimated_fills,
         }
 
 
@@ -70,8 +89,13 @@ class Watcher:
         prices: Optional[PriceOracle] = None,
         engine: Optional[PaperTradingEngine] = None,
         aggregator: Optional[Aggregator] = None,
+        queue: Optional[FetchQueue] = None,
+        trader_log: Optional[TraderLogger] = None,
+        kill_switch: Optional[KillSwitch] = None,
         concurrency: int = 16,
         refresh_seconds: float = 300.0,
+        workers: int = 4,
+        enrich: bool = True,
     ):
         self.cfg = cfg
         self.db = db
@@ -80,15 +104,24 @@ class Watcher:
         self.prices = prices or PriceOracle()
         self.engine = engine or PaperTradingEngine(cfg.paper, db)
         self.agg = aggregator or Aggregator(cfg.aggregation)
+        self.queue = queue
+        self.trader_log = trader_log or TraderLogger()
+        self.kill = kill_switch or KillSwitch()
         self.concurrency = max(1, concurrency)
+        self.workers = max(1, workers)
         self.refresh_seconds = refresh_seconds
+        self.enrich = enrich
 
         self.stats = WatchStats()
+        self.feed = StalenessGuard(
+            threshold_s=max(120.0, float(getattr(cfg.watch, "stale_after_seconds", 300.0)))
+        )
         self._tracked: dict[str, object] = {}
         self._sem: Optional[asyncio.Semaphore] = None
         self._running = False
         self._last_refresh = 0.0
         self._pending: set[asyncio.Task] = set()
+        self._drain_tasks: list[asyncio.Task] = []
 
     # ------------------------------------------------------------- bookkeeping
     def _refresh_tracked(self, force: bool = False) -> None:
@@ -103,43 +136,105 @@ class Watcher:
         self._refresh_tracked(force=True)
         return list(self._tracked)
 
-    # -------------------------------------------------------------- pipeline
+    # ---------------------------------------------------------------- producer
     async def _handle(self, note: Notification) -> None:
-        assert self.rpc is not None
+        """Queue a notification. Never performs a network call."""
         self.stats.notifications += 1
-        if self.rpc.already_seen(note.signature):
+        self.feed.note_event(note.received_at)
+
+        if self.queue is None:
+            return
+        # Cheapest possible rejection: a plain transfer costs us nothing at all.
+        if not is_swap_candidate(note.logs):
+            self.stats.filtered += 1
+            return
+        if self.queue.enqueue(note.signature, wallet=note.wallet, slot=note.slot):
+            self.stats.queued += 1
+        else:
+            # Already queued, in flight, or long since fetched. The websocket and
+            # the backfill poller both surface the same trade; count it once.
             self.stats.duplicates += 1
-            return
-        self.rpc.mark_seen(note.signature)
 
-        assert self._sem is not None
-        async with self._sem:
-            try:
-                tx = await self.rpc.get_transaction(note.signature)
-            except Exception as e:  # noqa: BLE001 - one bad fetch must not stop the feed
-                self.stats.fetch_errors += 1
-                log.debug("getTransaction %s failed: %s", note.signature[:12], e)
-                return
+    # ---------------------------------------------------------------- consumer
+    async def _process_one(self, signature: str, wallet: Optional[str]) -> None:
+        """Fetch, decode, enrich, price and record a single signature."""
+        assert self.rpc is not None
+        try:
+            tx = await self.rpc.get_transaction(signature)
+        except Exception as e:  # noqa: BLE001 - retry, never lose the trade
+            self.stats.fetch_errors += 1
+            if self.queue is not None:
+                self.queue.mark_failed(signature, f"{type(e).__name__}: {e}")
+            return
+
         if tx is None:
-            # Too old, or not yet available on the node we asked.
+            # Pruned, or not visible yet on this node. Keep it for a retry: a node
+            # that has not caught up is not the same as a trade that never existed.
             self.stats.not_found += 1
+            if self.queue is not None:
+                self.queue.mark_failed(signature, "not found")
             return
-        self.stats.fetched += 1
 
+        self.stats.fetched += 1
+        wanted = [wallet] if wallet else None
         trades = decode_trades(
-            tx,
-            wallets=[note.wallet],
-            sol_price_usd=self.cfg.paper.sol_price_usd,
+            tx, wallets=wanted, sol_price_usd=self.cfg.paper.sol_price_usd
         )
         if not trades:
+            if self.queue is not None:
+                self.queue.mark_done(signature)
             return
         self.stats.decoded += len(trades)
 
+        if self.enrich:
+            for t in trades:
+                try:
+                    enrich_trade(
+                        tx,
+                        t,
+                        wallets=wanted,
+                        sol_price_usd=self.cfg.paper.sol_price_usd,
+                    )
+                except Exception as e:  # noqa: BLE001 - enrichment is additive
+                    log.debug("enrich failed for %s: %s", signature[:12], e)
+
         await self._price(trades)
         self._record(trades)
+        if self.queue is not None:
+            self.queue.mark_done(signature)
 
+    async def drain_once(self, limit: Optional[int] = None) -> int:
+        """Claim and process one batch. Returns how many were handled."""
+        if self.queue is None:
+            return 0
+        batch = self.queue.claim(limit or max(8, self.concurrency))
+        if not batch:
+            return 0
+        assert self._sem is not None
+        async def one(item) -> None:
+            async with self._sem:
+                await self._process_one(item.signature, item.wallet)
+        await asyncio.gather(*(one(i) for i in batch), return_exceptions=True)
+        return len(batch)
+
+    async def _drain_loop(self) -> None:
+        """Keep the queue moving until stopped, backing off when it is empty."""
+        idle = 0.0
+        while self._running:
+            try:
+                n = await self.drain_once()
+            except Exception as e:  # noqa: BLE001 - a drain crash must not kill the run
+                log.warning("drain failed: %s", e)
+                n = 0
+            if n:
+                idle = 0.0
+            else:
+                idle = min(idle + 0.25, 5.0)
+                await asyncio.sleep(idle)
+
+    # ------------------------------------------------------------------ pricing
     async def _price(self, trades: list[Trade]) -> None:
-        """Fill missing price / liquidity from the keyless oracle."""
+        """Fill price / liquidity from the keyless oracle where the chain did not."""
         missing = [
             t.mint for t in trades if t.price <= 0 or t.pool_liquidity_usd is None
         ]
@@ -159,14 +254,29 @@ class Watcher:
             if t.pool_liquidity_usd is None:
                 t.pool_liquidity_usd = p.liquidity_usd
 
+    # ------------------------------------------------------------------ recording
     def _record(self, trades: list[Trade]) -> None:
-        """Persist observed trades, run the paper engine, emit signals."""
+        """Persist observed trades, run the paper engine, emit signals, log."""
         self._refresh_tracked()
         for t in trades:
             if t.price <= 0 or t.amount <= 0:
                 continue  # cannot simulate a fill without a price
-            self.db.insert_trade(t)
+            inserted = self.db.insert_trade(t)
+            if not inserted:
+                # The websocket and the backfill both surfaced it; count once.
+                self.stats.duplicates += 1
+                continue
             self.stats.trades += 1
+            if t.slippage_basis == "exact":
+                self.stats.exact_fills += 1
+            elif t.slippage_basis in ("estimate", "observed"):
+                self.stats.estimated_fills += 1
+
+            try:
+                self.trader_log.log_trade(t)
+            except Exception as e:  # noqa: BLE001 - logging must not stop ingest
+                log.debug("trader log failed: %s", e)
+
             try:
                 ct = self.engine.on_trade(t)
             except Exception as e:  # noqa: BLE001 - engine must never kill ingest
@@ -174,6 +284,10 @@ class Watcher:
                 continue
             if ct is not None:
                 self.stats.closed += 1
+                try:
+                    self.trader_log.log_close(ct)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("close log failed: %s", e)
 
         try:
             signals = self.agg.signals_from_trades(trades, self._tracked)
@@ -188,6 +302,8 @@ class Watcher:
     async def start(self, wallets: Optional[list[str]] = None) -> int:
         if self.ws is None or self.rpc is None:
             raise RuntimeError("Watcher needs a SubscriptionPool and an RpcPool")
+        if self.kill.engaged:
+            raise RuntimeError(f"kill switch engaged: {self.kill.reason}")
         self._running = True
         self._sem = asyncio.Semaphore(self.concurrency)
         watched = await self.ws.start(wallets if wallets is not None else self.wallets())
@@ -196,17 +312,28 @@ class Watcher:
         return watched
 
     async def run(self) -> None:
-        """Consume notifications until stopped."""
+        """Consume notifications and drain the queue until stopped."""
         assert self.ws is not None
-        async for note in self.ws.notifications():
-            if not self._running:
-                break
-            task = asyncio.create_task(self._handle(note))
-            self._pending.add(task)
-            task.add_done_callback(self._pending.discard)
-            # Bound the task backlog so memory cannot run away under a burst.
-            if len(self._pending) > self.concurrency * 4:
-                await asyncio.wait(self._pending, return_when=asyncio.FIRST_COMPLETED)
+        self._drain_tasks = [
+            asyncio.create_task(self._drain_loop()) for _ in range(self.workers)
+        ]
+        try:
+            async for note in self.ws.notifications():
+                if not self._running:
+                    break
+                task = asyncio.create_task(self._handle(note))
+                self._pending.add(task)
+                task.add_done_callback(self._pending.discard)
+                # Bound the enqueue backlog. Unlike the old in-memory fetch path
+                # this only delays *queuing*, and the backfill poller still covers
+                # anything the feed dropped, so nothing is lost by waiting here.
+                if len(self._pending) > self.concurrency * 4:
+                    await asyncio.wait(self._pending, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in self._drain_tasks:
+                t.cancel()
+            await asyncio.gather(*self._drain_tasks, return_exceptions=True)
+            self._drain_tasks.clear()
 
     async def stop(self) -> None:
         self._running = False
@@ -215,12 +342,28 @@ class Watcher:
         if self._pending:
             await asyncio.gather(*self._pending, return_exceptions=True)
             self._pending.clear()
+        try:
+            self.trader_log.flush_all_summaries()
+        except Exception as e:  # noqa: BLE001
+            log.debug("summary flush failed: %s", e)
         self.db.set_meta("watch_stopped_at", str(time.time()))
 
-    def summary(self) -> dict:
-        out: dict = {"stats": self.stats.as_dict()}
+    def health(self) -> dict:
+        """Current health, so silence is never the only signal."""
+        out: dict = {
+            "healthy": True,
+            "kill": self.kill.to_dict(),
+            "feed": self.feed.to_dict(),
+            "stats": self.stats.as_dict(),
+        }
+        if self.queue is not None:
+            out["queue"] = self.queue.stats()
         if self.rpc is not None:
             out["rpc"] = self.rpc.summary()
         if self.ws is not None:
             out["ws"] = self.ws.summary()
+        out["healthy"] = not self.kill.engaged and not self.feed.is_stale()
         return out
+
+    def summary(self) -> dict:
+        return self.health()

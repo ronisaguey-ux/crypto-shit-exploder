@@ -73,6 +73,14 @@ class Trade:
     fees_usd: float = 0.0
     slippage_bps: float = 0.0
     mev_tax_usd: float = 0.0
+    # Venue and the real market state read out of the transaction (see reserves.py).
+    dex: Optional[str] = None
+    slippage_basis: str = "none"  # exact | observed | estimate | none
+    pool: Optional[dict[str, Any]] = None
+    execution: Optional[dict[str, Any]] = None
+    # "observed" is what the trader did; "simulated" is our shadow fill of it.
+    # They share a signature on purpose, so the row key has to include this.
+    kind: str = "observed"
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property

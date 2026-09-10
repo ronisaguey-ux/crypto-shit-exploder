@@ -256,4 +256,5 @@ def _simulated(trade: Trade, eff_price: float, slip_bps: float, fee: float, mev:
         fees_usd=fee,
         slippage_bps=slip_bps,
         mev_tax_usd=mev,
+        kind="simulated",
     )

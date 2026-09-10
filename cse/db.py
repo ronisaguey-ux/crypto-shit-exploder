@@ -39,10 +39,21 @@ CREATE TABLE IF NOT EXISTS trades (
     effective_price REAL,
     fees_usd REAL,
     slippage_bps REAL,
-    mev_tax_usd REAL
+    mev_tax_usd REAL,
+    dex TEXT,
+    slippage_basis TEXT,
+    pool_json TEXT,
+    execution_json TEXT,
+    kind TEXT NOT NULL DEFAULT 'observed'
 );
 CREATE INDEX IF NOT EXISTS idx_trades_trader ON trades(trader);
 CREATE INDEX IF NOT EXISTS idx_trades_mint ON trades(mint);
+-- One observed trade is one row, however many times we see it (websocket, then
+-- backfill). ``kind`` keeps the shadow fill of that same trade — which shares the
+-- signature by design — from colliding with it. Partial index so simulated trades
+-- carrying no signature are still free to repeat.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_unique_kind
+    ON trades(signature, trader, mint, kind) WHERE signature IS NOT NULL;
 CREATE TABLE IF NOT EXISTS positions (
     id TEXT PRIMARY KEY,
     trader TEXT,
@@ -94,7 +105,28 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    #: Columns added to ``trades`` after the first release. ``CREATE TABLE IF NOT
+    #: EXISTS`` does nothing to a database that already exists, so an older
+    #: collector needs the columns added explicitly or every insert fails.
+    _ADDED_TRADE_COLUMNS = {
+        "dex": "TEXT",
+        "slippage_basis": "TEXT",
+        "pool_json": "TEXT",
+        "execution_json": "TEXT",
+        "kind": "TEXT NOT NULL DEFAULT 'observed'",
+    }
+
+    def _migrate(self) -> None:
+        have = {r["name"] for r in self._conn.execute("PRAGMA table_info(trades)")}
+        for name, sqltype in self._ADDED_TRADE_COLUMNS.items():
+            if name not in have:
+                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {sqltype}")
+        # Superseded by idx_trades_unique_kind; the old key collided observed rows
+        # with their own simulated fills.
+        self._conn.execute("DROP INDEX IF EXISTS idx_trades_unique")
 
     # ---------------------------------------------------------------- traders
     def upsert_trader(self, t: Trader) -> None:
@@ -159,23 +191,60 @@ class Database:
         return self._conn.execute("SELECT COUNT(*) FROM traders").fetchone()[0]
 
     # ----------------------------------------------------------------- trades
-    def insert_trade(self, t: Trade) -> None:
+    def insert_trade(self, t: Trade) -> bool:
+        """Record an observed trade. Returns True if it was new.
+
+        Idempotent on (signature, trader, mint): the websocket and the backfill
+        poller both surface the same swap, and a six-month collector that counted
+        it twice would inflate every downstream statistic.
+        """
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO trades
+                   (id, trader, mint, side, price, amount, signature, slot,
+                    pool_liquidity_usd, observed_at, effective_price, fees_usd,
+                    slippage_bps, mev_tax_usd, dex, slippage_basis,
+                    pool_json, execution_json, kind)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     t.id, t.trader, t.mint, t.side.value, t.price, t.amount,
                     t.signature, t.slot, t.pool_liquidity_usd, t.observed_at,
                     t.effective_price, t.fees_usd, t.slippage_bps, t.mev_tax_usd,
+                    t.dex, t.slippage_basis,
+                    json.dumps(t.pool) if t.pool else None,
+                    json.dumps(t.execution) if t.execution else None,
+                    t.kind,
                 ),
             )
             self._conn.commit()
+            return cur.rowcount > 0
 
     def recent_trades(self, limit: int = 100) -> list[Trade]:
         rows = self._conn.execute(
             "SELECT * FROM trades ORDER BY observed_at DESC LIMIT ?", (limit,)
         ).fetchall()
-        return [Trade.from_dict(dict(r)) for r in rows]
+        return [self._trade_from_row(dict(r)) for r in rows]
+
+    def trades_for(self, trader: str, limit: int = 1000) -> list[Trade]:
+        rows = self._conn.execute(
+            "SELECT * FROM trades WHERE trader=? ORDER BY observed_at DESC LIMIT ?",
+            (trader, limit),
+        ).fetchall()
+        return [self._trade_from_row(dict(r)) for r in rows]
+
+    def count_trades(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+
+    @staticmethod
+    def _trade_from_row(d: dict) -> Trade:
+        for col, attr in (("pool_json", "pool"), ("execution_json", "execution")):
+            raw = d.pop(col, None)
+            if raw:
+                try:
+                    d[attr] = json.loads(raw)
+                except (TypeError, ValueError):
+                    d[attr] = None
+        return Trade.from_dict(d)
 
     # -------------------------------------------------------------- positions
     def open_position(self, p: Position) -> None:

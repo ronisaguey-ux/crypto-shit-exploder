@@ -12,15 +12,20 @@ from cse.db import Database
 from cse.models import Side, Trader
 from cse.paper import PaperTradingEngine
 from cse.prices import PriceOracle
+from cse.queue import FetchQueue
 from cse.rpc import RpcEndpoint, RpcPool
 from cse.runner import build_ws_pool
 from cse.swapdecode import DEX_PROGRAMS, decode_trades, is_swap_candidate
+from cse.tradelog import TraderLogger
 from cse.watcher import Notification, Watcher
 
 WALLET = "Wallet111111111111111111111111111111111111111"
 POOL = "PooL11111111111111111111111111111111111111111"
 MINT = "Mint11111111111111111111111111111111111111111"
 SOL = "So11111111111111111111111111111111111111112"
+
+#: A log line naming a real DEX program, which is what the swap pre-filter keys on.
+_SWAP_LOG = "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]"
 
 
 def _tx(*, sig: str, sol_delta: float, token_delta: float, err=None, block_time=1_700_000_000):
@@ -261,6 +266,7 @@ async def test_watcher_records_trade_and_closes_round_trip(tmp_path):
         "buy-sig": _tx(sig="buy-sig", sol_delta=-1.0, token_delta=1000.0),
         "sell-sig": _tx(sig="sell-sig", sol_delta=1.0, token_delta=-1000.0),
     }
+    queue = FetchQueue(tmp_path / "queue.db")
     watcher = Watcher(
         cfg,
         db,
@@ -269,11 +275,20 @@ async def test_watcher_records_trade_and_closes_round_trip(tmp_path):
         prices=_StubPrices(),  # type: ignore[arg-type]
         engine=PaperTradingEngine(cfg.paper, db),
         aggregator=Aggregator(cfg.aggregation),
+        queue=queue,
+        trader_log=TraderLogger(tmp_path / "logs"),
     )
     watcher._sem = asyncio.Semaphore(4)
 
-    await watcher._handle(Notification(wallet=WALLET, signature="buy-sig"))
-    await watcher._handle(Notification(wallet=WALLET, signature="sell-sig"))
+    # Ingest only queues; a swap-looking log is what gets past the pre-filter.
+    await watcher._handle(Notification(wallet=WALLET, signature="buy-sig", logs=[_SWAP_LOG]))
+    await watcher._handle(Notification(wallet=WALLET, signature="sell-sig", logs=[_SWAP_LOG]))
+    assert watcher.stats.queued == 2
+    assert watcher.stats.trades == 0  # nothing fetched yet
+
+    # Draining is what actually fetches, decodes and records.
+    handled = await watcher.drain_once()
+    assert handled == 2
 
     assert watcher.stats.trades == 2
     assert watcher.stats.closed == 1
@@ -281,9 +296,40 @@ async def test_watcher_records_trade_and_closes_round_trip(tmp_path):
     # Each observed trade also stores the simulated fill, so 4 rows total.
     assert len(db.recent_trades(limit=50)) == 4
 
-    # A re-delivered notification must not be processed twice.
-    await watcher._handle(Notification(wallet=WALLET, signature="buy-sig"))
+    # A re-delivered notification is counted, not re-queued or re-fetched.
+    await watcher._handle(Notification(wallet=WALLET, signature="buy-sig", logs=[_SWAP_LOG]))
     assert watcher.stats.duplicates == 1
+    assert watcher.stats.trades == 2
+
+    # Every trade is on disk in the trader's own log directory.
+    tdir = tmp_path / "logs" / WALLET
+    assert (tdir / "trades.jsonl").exists()
+    assert (tdir / "trades.log").exists()
+    assert len((tdir / "trades.jsonl").read_text().strip().splitlines()) == 2
+    queue.close()
+    db.close()
+
+
+async def test_watcher_ignores_non_swap_notification(tmp_path):
+    """A notification whose logs show no DEX never costs a fetch."""
+    db = Database(tmp_path / "watch3.db")
+    db.upsert_trader(Trader(address=WALLET, source="test"))
+    cfg = Config()
+    queue = FetchQueue(tmp_path / "queue3.db")
+    watcher = Watcher(
+        cfg,
+        db,
+        rpc=_StubRpc({}),  # type: ignore[arg-type]
+        ws=None,
+        prices=_StubPrices(),  # type: ignore[arg-type]
+        queue=queue,
+    )
+    watcher._sem = asyncio.Semaphore(4)
+    await watcher._handle(Notification(wallet=WALLET, signature="plain", logs=["Program log: transfer"]))
+    assert watcher.stats.filtered == 1
+    assert watcher.stats.queued == 0
+    assert queue.stats()["total"] == 0
+    queue.close()
     db.close()
 
 
@@ -291,14 +337,20 @@ async def test_watcher_ignores_unparseable_transaction(tmp_path):
     db = Database(tmp_path / "watch2.db")
     db.upsert_trader(Trader(address=WALLET, source="test"))
     cfg = Config()
+    queue = FetchQueue(tmp_path / "queue2.db")
     watcher = Watcher(
         cfg,
         db,
         rpc=_StubRpc({"sig-x": {"slot": 1, "meta": {"err": None}}}),  # type: ignore[arg-type]
         ws=None,
         prices=_StubPrices(),  # type: ignore[arg-type]
+        queue=queue,
     )
     watcher._sem = asyncio.Semaphore(4)
-    await watcher._handle(Notification(wallet=WALLET, signature="sig-x"))
+    await watcher._handle(Notification(wallet=WALLET, signature="sig-x", logs=[_SWAP_LOG]))
+    await watcher.drain_once()
     assert watcher.stats.trades == 0
+    # Decoded nothing, so the signature is finished rather than retried forever.
+    assert queue.stats()["done"] == 1
+    queue.close()
     db.close()

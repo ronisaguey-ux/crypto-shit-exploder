@@ -116,6 +116,15 @@ class WatchConfig:
     refresh_seconds: float = 300.0
     price_ttl_seconds: float = 300.0
     queue_size: int = 100_000
+    #: Fetch workers draining the durable queue, and in-flight fetches per worker.
+    workers: int = 4
+    #: A feed this quiet is treated as broken, not calm.
+    stale_after_seconds: float = 300.0
+    #: Read real pool reserves and fees out of each transaction. Costs no extra
+    #: RPC call and is what makes the slippage numbers measured rather than fitted.
+    enrich: bool = True
+    #: Where the per-trader log tree is written.
+    log_dir: str = "logs/traders"
 
 
 @dataclass

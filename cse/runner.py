@@ -16,13 +16,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from typing import Optional
 
 from .config import Config
 from .db import Database
+from .backfill import Backfiller
+from .guards import KillSwitch
 from .prices import PriceOracle
+from .queue import FetchQueue
 from .rpc import RpcPool, RpcEndpoint, default_endpoints
 from .scoring import apply_scores, score_traders
+from .tradelog import TraderLogger
 from .watcher import Watcher
 from .ws import SubscriptionPool, WsEndpoint
 
@@ -107,15 +112,43 @@ def build_oracle(cfg: Config) -> PriceOracle:
     return PriceOracle(ttl_seconds=cfg.watch.price_ttl_seconds)
 
 
+def runtime_paths(db: Database) -> dict[str, str]:
+    """Sidecar files next to the database, so a run is one self-contained dir."""
+    base = Path(db.path).parent
+    base.mkdir(parents=True, exist_ok=True)
+    return {
+        "queue": str(base / "queue.db"),
+        "backfill": str(base / "backfill.db"),
+        "kill": str(base / "kill_switch.json"),
+    }
+
+
 def build_watcher(cfg: Config, db: Database) -> Watcher:
+    paths = runtime_paths(db)
     return Watcher(
         cfg,
         db,
         rpc=build_rpc_pool(cfg),
         ws=build_ws_pool(cfg),
         prices=build_oracle(cfg),
+        queue=FetchQueue(paths["queue"]),
+        trader_log=TraderLogger(cfg.watch.log_dir),
+        kill_switch=KillSwitch(paths["kill"]),
         concurrency=cfg.rpc.concurrency,
+        workers=cfg.watch.workers,
         refresh_seconds=cfg.watch.refresh_seconds,
+        enrich=cfg.watch.enrich,
+    )
+
+
+def build_backfiller(cfg: Config, db: Database, rpc: RpcPool, queue: FetchQueue):
+    """The completeness safety net for the live feed."""
+    paths = runtime_paths(db)
+    return Backfiller(
+        rpc,
+        queue,
+        state_path=paths["backfill"],
+        poll_interval=cfg.watch.refresh_seconds,
     )
 
 
@@ -146,6 +179,9 @@ async def run_watch(
     watcher = build_watcher(cfg, db)
     watched = await watcher.start(wallets)
     log.info("watching %d wallets", watched)
+    backfiller = build_backfiller(cfg, db, watcher.rpc, watcher.queue)
+    stop = asyncio.Event()
+    bf_task = asyncio.create_task(backfiller.run_forever(watcher.wallets, stop))
     started = time.time()
     try:
         if duration is None:
@@ -161,6 +197,9 @@ async def run_watch(
                 run_task.cancel()
                 await asyncio.gather(run_task, return_exceptions=True)
     finally:
+        stop.set()
+        bf_task.cancel()
+        await asyncio.gather(bf_task, return_exceptions=True)
         await watcher.stop()
         try:
             await watcher.prices.aclose()
@@ -169,6 +208,7 @@ async def run_watch(
             pass
     summary = watcher.summary()
     summary["watched"] = watched
+    summary["backfill"] = backfiller.stats()
     summary["elapsed_seconds"] = round(time.time() - started, 1)
     return summary
 
@@ -204,6 +244,9 @@ async def run_supervisor(
     watched = await watcher.start()
     log.info("watching %d wallets", watched)
     run_task = asyncio.create_task(watcher.run())
+    backfiller = build_backfiller(cfg, db, watcher.rpc, watcher.queue)
+    stop = asyncio.Event()
+    bf_task = asyncio.create_task(backfiller.run_forever(watcher.wallets, stop))
     try:
         while True:
             if duration is not None and (time.time() - started) >= duration:
@@ -220,11 +263,15 @@ async def run_supervisor(
                     log.warning("rescore failed: %s", e)
                 next_maintenance = time.time() + interval
     finally:
+        stop.set()
+        bf_task.cancel()
+        await asyncio.gather(bf_task, return_exceptions=True)
         run_task.cancel()
         await asyncio.gather(run_task, return_exceptions=True)
         await watcher.stop()
     summary = watcher.summary()
     summary["watched"] = watched
     summary["traders"] = db.count_traders()
+    summary["backfill"] = backfiller.stats()
     summary["elapsed_seconds"] = round(time.time() - started, 1)
     return summary
