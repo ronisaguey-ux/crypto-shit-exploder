@@ -167,6 +167,7 @@ class RpcPool:
         timeout: float = 30.0,
         max_attempts: int = 6,
         client: Optional[httpx.AsyncClient] = None,
+        max_connections: int = 16,
     ):
         if not endpoints:
             raise ValueError("RpcPool needs at least one endpoint")
@@ -175,6 +176,7 @@ class RpcPool:
         self.max_attempts = max_attempts
         self._client = client
         self._owns_client = client is None
+        self.max_connections = max(2, int(max_connections))
         self._ids = itertools.count(1)
         #: Signatures already fetched, so a re-delivered notification is free.
         self._seen: set[str] = set()
@@ -185,7 +187,15 @@ class RpcPool:
     async def _client_or_new(self) -> tuple[httpx.AsyncClient, bool]:
         if self._client is not None:
             return self._client, False
-        return httpx.AsyncClient(timeout=self.timeout), True
+        # Bounded pools: httpx defaults to 100 connections with 20 keep-alive,
+        # and every idle keep-alive socket holds read/write buffers for as long as
+        # the process lives. A six-month run does not need 100 sockets to two hosts.
+        limits = httpx.Limits(
+            max_connections=self.max_connections,
+            max_keepalive_connections=max(2, self.max_connections // 2),
+            keepalive_expiry=30.0,
+        )
+        return httpx.AsyncClient(timeout=self.timeout, limits=limits), True
 
     def _order(self, heavy: bool) -> list[RpcEndpoint]:
         """Cheapest healthy endpoint first, so free tiers absorb the load."""

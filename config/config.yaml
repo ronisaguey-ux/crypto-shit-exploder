@@ -121,3 +121,18 @@ watch:
   enrich: true
   # Per-trader log tree: trades.jsonl, daily slices, positions, rolling summary.
   log_dir: logs/traders
+  # How often to autosave summaries, prune settled queue rows and checkpoint the
+  # WALs. This is the crash-safety interval: a hard kill can lose at most this
+  # much of the rolling summary, never a trade (trades are written on arrival).
+  maintenance_seconds: 300.0
+  # Settled queue rows are deleted once older than this. Safe because the backfill
+  # cursor only moves forward and never revisits a signature behind it. Set to 0
+  # to keep every row (the queue then grows without bound: ~45M rows over 6mo).
+  queue_retention_hours: 72.0
+  # Hard ceiling on pending signatures. The keyless pool fetches ~6/s, and a
+  # handful of high-frequency wallets can produce ~20/s, so without a cap the
+  # backlog grows without bound. Past the cap the OLDEST are dropped (they are the
+  # ones the RPC nodes are closest to pruning anyway) and counted in stats.shed,
+  # so a run reports exactly how much it had to give up instead of silently
+  # sampling. Raise it with a paid RPC key; set 0 to disable (not advised).
+  queue_max_pending: 500000

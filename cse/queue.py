@@ -17,6 +17,7 @@ seeing the same trade twice (websocket + backfill) costs one fetch, not two.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -209,6 +210,91 @@ class FetchQueue:
             )
             self._conn.commit()
             return cur.rowcount
+
+    # ------------------------------------------------------------------- upkeep
+    def prune(self, older_than_s: float, keep_failed: bool = True) -> int:
+        """Delete settled rows older than ``older_than_s``. Returns rows removed.
+
+        The queue doubles as the dedupe store, so pruning needs a reason to be
+        safe. It has one: the backfill cursor only ever moves *forward* and is
+        advanced only after everything behind it has been enqueued, so a signature
+        older than the cursor is never surfaced again — not by the poller, and not
+        by the websocket, which only reports new slots. Deleting a settled row
+        therefore cannot resurrect a fetch.
+
+        ``failed`` rows are kept by default: they are the short list worth
+        inspecting, and ``requeue_failed`` is the recovery path for them.
+        """
+        cutoff = time.time() - max(60.0, float(older_than_s))
+        with self._lock:
+            if keep_failed:
+                cur = self._conn.execute(
+                    "DELETE FROM fetch_queue"
+                    " WHERE status='done' AND COALESCE(fetched_at, discovered_at) < ?",
+                    (cutoff,),
+                )
+            else:
+                cur = self._conn.execute(
+                    "DELETE FROM fetch_queue"
+                    " WHERE status IN ('done','failed')"
+                    "   AND COALESCE(fetched_at, discovered_at) < ?",
+                    (cutoff,),
+                )
+            self._conn.commit()
+            return cur.rowcount
+
+    def enforce_cap(self, max_pending: int) -> int:
+        """Shed the oldest pending rows once the backlog exceeds ``max_pending``.
+
+        The queue promises not to lose work, and that promise holds only while the
+        observed swap rate fits inside the RPC fetch budget. It does for real
+        traders and it does not for bots: a handful of high-frequency wallets can
+        produce ~20 signatures/second against a keyless pool that fetches ~6, so an
+        unbounded queue is a disk-filling bug wearing a completeness promise.
+
+        Oldest-first is the honest policy, not just the convenient one: a
+        transaction old enough to still be sitting in the backlog is one the RPC
+        nodes are closest to pruning, so it is both the least likely to be
+        fetchable and the least valuable to keep. Shed rows are counted so the run
+        reports exactly how much it had to give up instead of quietly sampling.
+        """
+        cap = int(max_pending)
+        if cap <= 0:
+            return 0
+        with self._lock:
+            total = self._conn.execute(
+                "SELECT COUNT(*) FROM fetch_queue WHERE status='pending'"
+            ).fetchone()[0]
+            excess = int(total) - cap
+            if excess <= 0:
+                return 0
+            cur = self._conn.execute(
+                "DELETE FROM fetch_queue WHERE signature IN ("
+                "  SELECT signature FROM fetch_queue WHERE status='pending'"
+                "  ORDER BY slot IS NULL, slot ASC, discovered_at ASC LIMIT ?"
+                ")",
+                (excess,),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def checkpoint(self) -> None:
+        """Fold the write-ahead log back into the database file.
+
+        Without this the WAL grows for the life of the process. On a six-month run
+        that is gigabytes of disk held by a file nobody is reading.
+        """
+        with self._lock:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def size_bytes(self) -> int:
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                total += os.path.getsize(self.path + suffix)
+            except OSError:
+                pass
+        return total
 
     def close(self) -> None:
         with self._lock:

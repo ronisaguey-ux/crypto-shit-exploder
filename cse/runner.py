@@ -17,7 +17,7 @@ import asyncio
 import logging
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .config import Config
 from .db import Database
@@ -163,6 +163,40 @@ def rescore(cfg: Config, db: Database) -> int:
     return len(reports)
 
 
+def _install_signal_handlers(stop: asyncio.Event) -> Callable[[], None]:
+    """Turn SIGTERM/SIGINT into a clean stop instead of an abrupt death.
+
+    The trade log is append-only, so it survives a kill either way. What does not
+    is the in-memory rolling summary per trader, which only reaches disk on a clean
+    stop: without this, a `systemctl stop` after five months would discard every
+    trader's summary. Returns a restore function for tests and repeated runs.
+    """
+    import signal
+
+    loop = asyncio.get_running_loop()
+    installed: list[int] = []
+
+    def handler() -> None:
+        log.info("stop signal received; finishing the current batch and saving")
+        stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, handler)
+            installed.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            continue
+
+    def restore() -> None:
+        for sig in installed:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+
+    return restore
+
+
 async def run_watch(
     cfg: Config,
     db: Database,
@@ -174,32 +208,35 @@ async def run_watch(
     """Watch the pool and paper-trade every observed trade.
 
     `duration` seconds bounds the run (used for verification); None runs until
-    cancelled.
+    cancelled or signalled.
     """
     watcher = build_watcher(cfg, db)
     watched = await watcher.start(wallets)
     log.info("watching %d wallets", watched)
     backfiller = build_backfiller(cfg, db, watcher.rpc, watcher.queue)
     stop = asyncio.Event()
+    restore_signals = _install_signal_handlers(stop)
     bf_task = asyncio.create_task(backfiller.run_forever(watcher.wallets, stop))
+    run_task = asyncio.create_task(watcher.run())
     started = time.time()
+    deadline = None if duration is None else started + duration
     try:
-        if duration is None:
-            await watcher.run()
-        else:
-            run_task = asyncio.create_task(watcher.run())
+        while not stop.is_set() and not run_task.done():
+            if deadline is not None and time.time() >= deadline:
+                break
             try:
-                while time.time() - started < duration:
-                    await asyncio.sleep(min(heartbeat, duration))
-                    db.set_meta("watch_heartbeat", str(time.time()))
-                    log.info("watch stats: %s", watcher.stats.as_dict())
-            finally:
-                run_task.cancel()
-                await asyncio.gather(run_task, return_exceptions=True)
+                await asyncio.wait_for(stop.wait(), timeout=min(heartbeat, 5.0))
+            except asyncio.TimeoutError:
+                pass
+            db.set_meta("watch_heartbeat", str(time.time()))
+            log.info("watch stats: %s", watcher.stats.as_dict())
     finally:
+        restore_signals()
         stop.set()
         bf_task.cancel()
         await asyncio.gather(bf_task, return_exceptions=True)
+        run_task.cancel()
+        await asyncio.gather(run_task, return_exceptions=True)
         await watcher.stop()
         try:
             await watcher.prices.aclose()
@@ -209,6 +246,7 @@ async def run_watch(
     summary = watcher.summary()
     summary["watched"] = watched
     summary["backfill"] = backfiller.stats()
+    summary["footprint"] = watcher.footprint()
     summary["elapsed_seconds"] = round(time.time() - started, 1)
     return summary
 
@@ -246,12 +284,16 @@ async def run_supervisor(
     run_task = asyncio.create_task(watcher.run())
     backfiller = build_backfiller(cfg, db, watcher.rpc, watcher.queue)
     stop = asyncio.Event()
+    restore_signals = _install_signal_handlers(stop)
     bf_task = asyncio.create_task(backfiller.run_forever(watcher.wallets, stop))
     try:
-        while True:
+        while not stop.is_set() and not run_task.done():
             if duration is not None and (time.time() - started) >= duration:
                 break
-            await asyncio.sleep(60)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=60.0)
+            except asyncio.TimeoutError:
+                pass
             db.set_meta("watch_heartbeat", str(time.time()))
             if time.time() >= next_maintenance:
                 try:
@@ -263,6 +305,7 @@ async def run_supervisor(
                     log.warning("rescore failed: %s", e)
                 next_maintenance = time.time() + interval
     finally:
+        restore_signals()
         stop.set()
         bf_task.cancel()
         await asyncio.gather(bf_task, return_exceptions=True)
@@ -273,5 +316,6 @@ async def run_supervisor(
     summary["watched"] = watched
     summary["traders"] = db.count_traders()
     summary["backfill"] = backfiller.stats()
+    summary["footprint"] = watcher.footprint()
     summary["elapsed_seconds"] = round(time.time() - started, 1)
     return summary

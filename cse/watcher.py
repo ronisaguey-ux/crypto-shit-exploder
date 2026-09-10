@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -42,6 +43,38 @@ from .ws import Notification, SubscriptionPool
 log = logging.getLogger("cse.watcher")
 
 
+def _rss_bytes() -> int:
+    """Resident set size, or 0 where the platform will not say.
+
+    A six-month run has to be able to prove it is not leaking, and the only
+    credible evidence is the number the kernel reports about this process.
+    """
+    try:
+        with open("/proc/self/statm", "r") as fh:
+            pages = int(fh.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _trim_allocator() -> bool:
+    """Hand freed arenas back to the OS. Returns whether it ran.
+
+    Python returns objects to the allocator, and glibc keeps that memory for reuse
+    instead of releasing it, so the resident set of a long-lived process only ever
+    climbs. Measured here: tracemalloc attributed ~1 MB of a 66 MB RSS rise to
+    Python objects, so nearly all of it was native buffers and allocator arenas.
+    This is the call that gives it back.
+    """
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
 @dataclass
 class WatchStats:
     notifications: int = 0
@@ -57,6 +90,7 @@ class WatchStats:
     signals: int = 0
     exact_fills: int = 0
     estimated_fills: int = 0
+    shed: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -73,6 +107,7 @@ class WatchStats:
             "signals": self.signals,
             "exact_fills": self.exact_fills,
             "estimated_fills": self.estimated_fills,
+            "shed": self.shed,
         }
 
 
@@ -111,6 +146,15 @@ class Watcher:
         self.workers = max(1, workers)
         self.refresh_seconds = refresh_seconds
         self.enrich = enrich
+        self.maintenance_seconds = float(
+            getattr(cfg.watch, "maintenance_seconds", 300.0)
+        )
+        self.queue_retention_s = float(
+            getattr(cfg.watch, "queue_retention_hours", 72.0)
+        ) * 3600.0
+        self.queue_max_pending = int(
+            getattr(cfg.watch, "queue_max_pending", 500_000)
+        )
 
         self.stats = WatchStats()
         self.feed = StalenessGuard(
@@ -120,8 +164,10 @@ class Watcher:
         self._sem: Optional[asyncio.Semaphore] = None
         self._running = False
         self._last_refresh = 0.0
+        self._last_maintain = time.time()
         self._pending: set[asyncio.Task] = set()
         self._drain_tasks: list[asyncio.Task] = []
+        self._maintain_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------- bookkeeping
     def _refresh_tracked(self, force: bool = False) -> None:
@@ -232,6 +278,69 @@ class Watcher:
                 idle = min(idle + 0.25, 5.0)
                 await asyncio.sleep(idle)
 
+    # -------------------------------------------------------------- maintenance
+    def maintain(self) -> dict:
+        """Periodic upkeep: autosave logs, prune settled work, checkpoint WALs.
+
+        This is what makes the run crash-safe rather than merely restart-safe. The
+        rolling summaries are held in memory and would otherwise only reach disk on
+        a clean stop, so a kill -9 would lose every trader's summary back to the
+        start of the run. Everything else here bounds disk: settled queue rows are
+        deleted once the backfill cursor has moved past them, and the WAL is folded
+        back into the database instead of growing for six months.
+        """
+        out: dict = {"at": time.time()}
+        try:
+            out["summaries_flushed"] = self.trader_log.flush_all_summaries()
+        except Exception as e:  # noqa: BLE001 - upkeep must never kill ingest
+            log.warning("summary flush failed: %s", e)
+            out["summaries_flushed"] = 0
+        try:
+            if self.queue is not None and self.queue_retention_s > 0:
+                out["queue_pruned"] = self.queue.prune(self.queue_retention_s)
+            if self.queue is not None and self.queue_max_pending > 0:
+                shed = self.queue.enforce_cap(self.queue_max_pending)
+                if shed:
+                    self.stats.shed += shed
+                    log.warning(
+                        "queue over cap (%d pending); shed %d oldest signatures",
+                        self.queue_max_pending,
+                        shed,
+                    )
+                out["queue_shed"] = shed
+            if self.queue is not None:
+                self.queue.checkpoint()
+        except Exception as e:  # noqa: BLE001
+            log.warning("queue upkeep failed: %s", e)
+        try:
+            self.db.checkpoint()
+        except Exception as e:  # noqa: BLE001
+            log.warning("db checkpoint failed: %s", e)
+        out["rss_before_trim"] = _rss_bytes()
+        out["allocator_trimmed"] = _trim_allocator()
+        out["rss_bytes"] = _rss_bytes()
+        self._last_maintain = time.time()
+        return out
+
+    async def _maintain_loop(self) -> None:
+        """Run ``maintain`` on a timer for as long as the watcher is up."""
+        interval = max(30.0, float(self.maintenance_seconds))
+        while self._running:
+            await asyncio.sleep(interval)
+            if not self._running:
+                break
+            try:
+                stats = self.maintain()
+            except Exception as e:  # noqa: BLE001
+                log.warning("maintenance failed: %s", e)
+                continue
+            log.info(
+                "maintenance: summaries=%s pruned=%s rss=%.1fMB",
+                stats.get("summaries_flushed", 0),
+                stats.get("queue_pruned", 0),
+                stats.get("rss_bytes", 0) / 1e6,
+            )
+
     # ------------------------------------------------------------------ pricing
     async def _price(self, trades: list[Trade]) -> None:
         """Fill price / liquidity from the keyless oracle where the chain did not."""
@@ -317,6 +426,7 @@ class Watcher:
         self._drain_tasks = [
             asyncio.create_task(self._drain_loop()) for _ in range(self.workers)
         ]
+        self._maintain_task = asyncio.create_task(self._maintain_loop())
         try:
             async for note in self.ws.notifications():
                 if not self._running:
@@ -334,6 +444,10 @@ class Watcher:
                 t.cancel()
             await asyncio.gather(*self._drain_tasks, return_exceptions=True)
             self._drain_tasks.clear()
+            if self._maintain_task is not None:
+                self._maintain_task.cancel()
+                await asyncio.gather(self._maintain_task, return_exceptions=True)
+                self._maintain_task = None
 
     async def stop(self) -> None:
         self._running = False
@@ -342,10 +456,11 @@ class Watcher:
         if self._pending:
             await asyncio.gather(*self._pending, return_exceptions=True)
             self._pending.clear()
+        # Final autosave + checkpoint, so a clean shutdown leaves nothing in RAM.
         try:
-            self.trader_log.flush_all_summaries()
+            self.maintain()
         except Exception as e:  # noqa: BLE001
-            log.debug("summary flush failed: %s", e)
+            log.debug("final maintenance failed: %s", e)
         self.db.set_meta("watch_stopped_at", str(time.time()))
 
     def health(self) -> dict:
@@ -355,6 +470,7 @@ class Watcher:
             "kill": self.kill.to_dict(),
             "feed": self.feed.to_dict(),
             "stats": self.stats.as_dict(),
+            "rss_bytes": _rss_bytes(),
         }
         if self.queue is not None:
             out["queue"] = self.queue.stats()
@@ -363,6 +479,23 @@ class Watcher:
         if self.ws is not None:
             out["ws"] = self.ws.summary()
         out["healthy"] = not self.kill.engaged and not self.feed.is_stale()
+        return out
+
+    def footprint(self) -> dict:
+        """Memory and disk held right now — the two ways a long run dies."""
+        out: dict = {
+            "rss_bytes": _rss_bytes(),
+            "db_bytes": self.db.size_bytes(),
+            "rows": self.db.row_counts(),
+            "summaries_held": len(getattr(self.trader_log, "_summaries", {})),
+            "open_log_files": len(getattr(self.trader_log, "_open", {})),
+            "price_cache": len(getattr(self.prices, "_cache", {})),
+            "seconds_since_maintenance": round(time.time() - self._last_maintain, 1),
+        }
+        if self.queue is not None:
+            out["queue_bytes"] = self.queue.size_bytes()
+        if self.rpc is not None:
+            out["seen_signatures"] = len(getattr(self.rpc, "_seen", ()))
         return out
 
     def summary(self) -> dict:

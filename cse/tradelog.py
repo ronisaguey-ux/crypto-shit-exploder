@@ -33,6 +33,12 @@ log = logging.getLogger("cse.tradelog")
 #: captures nearly all the reuse without risking the descriptor limit.
 _MAX_OPEN = 64
 
+#: Distinct mints remembered per trader in the rolling summary. The summary dict
+#: lives for the entire run (one per trader), so this list must not grow without
+#: bound; it is a recent window, and the summary sets ``mints_truncated`` when the
+#: window has dropped older entries.
+_MAX_MINTS = 100
+
 
 def _day(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -167,8 +173,13 @@ class TraderLogger:
             s["last_seen"] = max(s["last_seen"], trade.observed_at)
             if trade.mint not in s["mints"]:
                 s["mints"].append(trade.mint)
-                if len(s["mints"]) > 500:
-                    s["mints"] = s["mints"][-500:]
+                # Bounded because this dict lives for the whole run, one entry per
+                # trader: 5k traders x an unbounded mint list is the leak that kills
+                # a six-month process. This is a recent window, so the summary flags
+                # when it overflowed rather than implying it is the full set.
+                if len(s["mints"]) > _MAX_MINTS:
+                    del s["mints"][0]
+                    s["mints_truncated"] = True
 
     def flush_summary(self, wallet: str) -> None:
         """Write the rolling summary for one wallet to disk."""

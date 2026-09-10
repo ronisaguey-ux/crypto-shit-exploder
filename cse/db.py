@@ -104,6 +104,12 @@ class Database:
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # A long-lived writer must not let the WAL grow for the whole run; the
+        # maintenance loop also calls checkpoint() explicitly. NORMAL is the right
+        # durability level here: a crash can lose the last transaction, never the
+        # database, and this collector re-derives anything it missed from chain.
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA wal_autocheckpoint=1000")
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._conn.commit()
@@ -327,5 +333,38 @@ class Database:
         r = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return r[0] if r else None
 
+    # ------------------------------------------------------------------ upkeep
+    def checkpoint(self) -> None:
+        """Fold the WAL back into the database file and truncate it."""
+        with self._lock:
+            self._conn.commit()
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def size_bytes(self) -> int:
+        """On-disk size of the database including its WAL and shared-memory file."""
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                total += (self.path.parent / (self.path.name + suffix)).stat().st_size
+            except OSError:
+                pass
+        return total
+
+    def row_counts(self) -> dict[str, int]:
+        """Cheap table census, so a run's growth is observable not guessed."""
+        out: dict[str, int] = {}
+        with self._lock:
+            for table in ("traders", "trades", "positions", "closed_trades", "signals"):
+                try:
+                    r = self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                    out[table] = int(r[0]) if r else 0
+                except sqlite3.Error:
+                    continue
+        return out
+
     def close(self) -> None:
+        try:
+            self.checkpoint()
+        except sqlite3.Error:
+            pass
         self._conn.close()

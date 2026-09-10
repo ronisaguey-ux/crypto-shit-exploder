@@ -125,6 +125,16 @@ class WatchConfig:
     enrich: bool = True
     #: Where the per-trader log tree is written.
     log_dir: str = "logs/traders"
+    #: Autosave/prune/checkpoint interval. Bounds how much rolling summary a hard
+    #: kill can cost; trades themselves are written the moment they are decoded.
+    maintenance_seconds: float = 300.0
+    #: Delete settled queue rows older than this. Safe because the backfill cursor
+    #: never revisits a signature behind it. 0 disables pruning (unbounded growth).
+    queue_retention_hours: float = 72.0
+    #: Hard ceiling on pending signatures. Past it the oldest are shed and counted
+    #: in stats.shed. This exists because the fetch budget is finite: real traders
+    #: fit inside it, bots do not, and an uncapped queue would fill the disk.
+    queue_max_pending: int = 500_000
 
 
 @dataclass

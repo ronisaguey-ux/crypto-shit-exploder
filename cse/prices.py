@@ -57,21 +57,53 @@ class PriceOracle:
         timeout: float = 20.0,
         min_interval: float = 0.25,
         client: Optional[httpx.AsyncClient] = None,
+        max_entries: int = 20_000,
+        max_connections: int = 8,
     ):
         self.ttl = ttl_seconds
         self.timeout = timeout
         self._min_interval = min_interval
         self._client = client
         self._owns_client = client is None
+        self.max_connections = max(2, int(max_connections))
         self._cache: dict[str, TokenPrice] = {}
+        # A six-month run prices every shitcoin it ever sees. Without a bound the
+        # cache is a slow leak: expired entries were never removed, only ignored.
+        self._max_entries = max(64, int(max_entries))
         self._lock = asyncio.Lock()
         self._last_call = 0.0
-        self.stats = {"dexscreener": 0, "geckoterminal": 0, "misses": 0}
+        self.stats = {
+            "dexscreener": 0,
+            "geckoterminal": 0,
+            "misses": 0,
+            "evicted": 0,
+        }
+
+    def _evict(self) -> None:
+        """Drop expired entries, then the oldest quarter if still over the cap."""
+        now = time.time()
+        expired = [m for m, p in self._cache.items() if (now - p.at) >= self.ttl]
+        for m in expired:
+            self._cache.pop(m, None)
+        if len(self._cache) <= self._max_entries:
+            self.stats["evicted"] += len(expired)
+            return
+        # Still too big: the TTL is long relative to the mint churn, so evict the
+        # least recently priced quarter outright. A re-price is one HTTP call.
+        ordered = sorted(self._cache.items(), key=lambda kv: kv[1].at)
+        for m, _ in ordered[: max(1, len(ordered) // 4)]:
+            self._cache.pop(m, None)
+        self.stats["evicted"] += len(expired) + max(1, len(ordered) // 4)
 
     async def _client_or_new(self) -> tuple[httpx.AsyncClient, bool]:
         if self._client is not None:
             return self._client, False
-        return httpx.AsyncClient(timeout=self.timeout), True
+        limits = httpx.Limits(
+            max_connections=self.max_connections,
+            max_keepalive_connections=max(2, self.max_connections // 2),
+            keepalive_expiry=30.0,
+        )
+        return httpx.AsyncClient(timeout=self.timeout, limits=limits), True
 
     async def _throttle(self) -> None:
         """Keep well clear of the free-tier request rates."""
@@ -197,6 +229,8 @@ class PriceOracle:
             result.update(await self._geckoterminal(still))
         self.stats["misses"] += len(missing)
         self._cache.update(result)
+        if len(self._cache) > self._max_entries:
+            self._evict()
         return result
 
     async def price(self, mint: str) -> Optional[float]:
