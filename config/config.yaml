@@ -1,0 +1,73 @@
+# crypto-shit-exploder — runtime configuration
+# All values can be overridden by env vars prefixed CSE_ (see cse/config.py).
+
+discovery:
+  # How many top traders to pull from the leaderboards before paper-trading.
+  target_traders: 2000
+  # Provider priority order. First provider that answers wins; the rest are fallbacks.
+  providers: [solanatracker, vybe, birdeye]
+  # Leaderboard lookback window in days.
+  window_days: 30
+  # PnL accounting mode for SolanaTracker: strict | adjusted | raw
+  pnl_mode: adjusted
+  # Per-provider page size (providers cap at 1000).
+  page_size: 1000
+  # Minimum on-chain volume (USD) for a wallet to be considered.
+  min_volume_usd: 50000
+  # Minimum number of trades for a wallet to be considered.
+  min_trades: 30
+
+paper:
+  # Starting equity per simulated trader (USD).
+  starting_equity_usd: 10000
+  # Fraction of equity committed per signal.
+  position_pct: 0.10
+  # Fixed slippage in basis points (100 bps = 1%). Used when dynamic slippage is off.
+  slippage_bps: 150
+  # Use liquidity-derived dynamic slippage instead of the fixed rate.
+  dynamic_slippage: true
+  # Slippage is multiplied by a uniform draw in this range to model variance.
+  slippage_jitter: [0.5, 1.5]
+  # Assumed delay between observing a signal and our fill (seconds).
+  latency_seconds: 3.0
+  # Extra adverse-selection tax applied on top of slippage (bps).
+  mev_tax_bps: 25
+  # Solana base fee per transaction (lamports).
+  base_fee_lamports: 5000
+  # Priority fee per transaction (lamports). ~0.00005 SOL default.
+  priority_fee_lamports: 50000
+  # Lamports per SOL (fixed for accounting).
+  lamports_per_sol: 1000000000
+  # SOL price used to convert fees into USD for PnL accounting.
+  sol_price_usd: 150.0
+  # Trades larger than this % of pool liquidity take the full slippage curve.
+  max_liquidity_impact_pct: 0.05
+
+scoring:
+  # Minimum closed trades before a trader receives a fitness score.
+  min_trades: 20
+  # Weight of each normalized component in the composite fitness score.
+  weights:
+    sharpe: 0.35
+    sortino: 0.20
+    win_rate: 0.15
+    profit_factor: 0.15
+    max_drawdown: 0.15
+  # tanh scale for ratio components (higher = more linear near zero).
+  tanh_scale: 2.0
+  # Annualization factor: Solana trades are not daily; 365 * 24 for hourly-ish cadence.
+  annualization: 8760
+
+aggregation:
+  # Only traders with fitness >= this are allowed to emit signals.
+  min_fitness: 0.15
+  # Aggregate signal must exceed this (-1..1) to act.
+  confidence_threshold: 0.5
+  # Weight = max(fitness, 0) ** weight_power.
+  weight_power: 2.0
+  # Decay half-life (hours) applied to a signal's weight as it ages.
+  signal_half_life_hours: 6.0
+  # Ignore duplicate signals on the same mint within this window (seconds).
+  dedupe_window_seconds: 60
+  # Maximum concurrent open positions in the aggregate portfolio.
+  max_open_positions: 20

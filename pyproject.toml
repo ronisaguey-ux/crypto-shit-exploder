@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crypto-shit-exploder"
+version = "0.1.0"
+description = "Aggregate top on-chain Solana traders into a single paper-traded strategy."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ronisaguey-ux" }]
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+    "numpy>=1.26",
+    "python-dotenv>=1.0",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "respx>=0.21"]
+
+[project.scripts]
+cse = "cse.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cse*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"
