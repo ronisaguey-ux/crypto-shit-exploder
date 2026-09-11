@@ -280,6 +280,31 @@ class PaperTradingEngine:
         self.db.insert_trade(_simulated(trade, eff_price, slip_bps, fee, mev))
         return closed
 
+    def mark_to_market(self, trader: str, mint: str, price: float) -> float:
+        """Unrealized PnL on an open position at ``price``, in USD.
+
+        Equity was only ever moved on close, so an open position contributed
+        nothing and a buy-and-hold trader looked like a loser until the round
+        trip completed (F-020). This values the position at the current price
+        without touching cash — the tokens are already paid for.
+        """
+        pos = self.db.get_position(trader, mint)
+        if pos is None or price <= 0:
+            return 0.0
+        return pos.amount * price - (pos.amount * pos.entry_price + pos.entry_fees_usd)
+
+    def unrealized(self, trader: str, price_of) -> float:
+        """Total unrealized PnL across a trader's open positions.
+
+        ``price_of`` maps a mint to its current USD price; unknown mints are
+        valued at their entry price so an unpriced position cannot invent PnL.
+        """
+        total = 0.0
+        for pos in self.db.open_positions(trader):
+            price = price_of(pos.mint) or pos.entry_price
+            total += self.mark_to_market(trader, pos.mint, price)
+        return total
+
     # ---------------------------------------------------------------- report
     def summary(self) -> list[dict]:
         return [
