@@ -29,7 +29,7 @@ from typing import Optional
 from .aggregation import Aggregator
 from .config import Config
 from .db import Database
-from .guards import KillSwitch, StalenessGuard
+from .guards import CircuitBreaker, KillSwitch, StalenessGuard
 from .models import Trade
 from .paper import PaperTradingEngine
 from .prices import PriceOracle
@@ -144,6 +144,7 @@ class Watcher:
         self.queue = queue
         self.trader_log = trader_log or TraderLogger()
         self.kill = kill_switch or KillSwitch()
+        self.breaker = CircuitBreaker()
         self.concurrency = max(1, concurrency)
         self.workers = max(1, workers)
         self.refresh_seconds = refresh_seconds
@@ -211,6 +212,7 @@ class Watcher:
             tx = await self.rpc.get_transaction(signature)
         except Exception as e:  # noqa: BLE001 - retry, never lose the trade
             self.stats.fetch_errors += 1
+            self.breaker.record_error()
             if self.queue is not None:
                 self.queue.mark_failed(signature, f"{type(e).__name__}: {e}")
             return
