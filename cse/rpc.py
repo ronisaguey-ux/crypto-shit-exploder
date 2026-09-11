@@ -195,7 +195,10 @@ class RpcPool:
             max_keepalive_connections=max(2, self.max_connections // 2),
             keepalive_expiry=30.0,
         )
-        return httpx.AsyncClient(timeout=self.timeout, limits=limits), True
+        # A User-Agent is expected by several public RPCs; without one a provider
+        # may treat the traffic as a bot and block it.
+        headers = {"User-Agent": "crypto-shit-exploder/1.0 (+https://github.com/ronisaguey-ux)"}
+        return httpx.AsyncClient(timeout=self.timeout, limits=limits, headers=headers), True
 
     def _order(self, heavy: bool) -> list[RpcEndpoint]:
         """Cheapest healthy endpoint first, so free tiers absorb the load."""
@@ -256,8 +259,14 @@ class RpcPool:
                 err = body.get("error")
                 if err:
                     code = err.get("code")
-                    # Retryable, or a per-endpoint capability gap: either way,
-                    # try the next endpoint rather than failing the whole call.
+                    # A JSON-RPC *error response* is not an endpoint failure. An
+                    # invalid signature (-32602) or a missing account is the
+                    # request's fault, not the node's — parking every endpoint
+                    # for it (and then sending to them anyway once all were
+                    # parked) turned one bad call into a full outage.
+                    if code in (-32602, -32600, -32601, -32000):
+                        last = RpcError(f"{ep.name} rpc {code}: {err.get('message')}")
+                        continue
                     ep.note_failure(rate_limited=True)
                     last = RpcError(f"{ep.name} rpc {code}: {err.get('message')}")
                     continue

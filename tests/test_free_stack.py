@@ -293,8 +293,10 @@ async def test_watcher_records_trade_and_closes_round_trip(tmp_path):
     assert watcher.stats.trades == 2
     assert watcher.stats.closed == 1
     assert len(db.closed_trades()) == 1
-    # Each observed trade also stores the simulated fill, so 4 rows total.
-    assert len(db.recent_trades(limit=50)) == 4
+    # recent_trades() is the observed feed only — the simulated fills those
+    # replays wrote are a separate kind and must not be replayed again.
+    assert len(db.recent_trades(limit=50)) == 2
+    assert len(db.recent_trades(limit=50, kind="simulated")) == 2
 
     # A re-delivered notification is counted, not re-queued or re-fetched.
     await watcher._handle(Notification(wallet=WALLET, signature="buy-sig", logs=[_SWAP_LOG]))

@@ -8,6 +8,7 @@ survived the simulation.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from typing import Optional
 from ..config import PaperConfig
 from ..db import Database
 from ..models import ClosedTrade, Position, Side, Trade
+from ..reserves import PoolState, effective_bps
 from .costs import FeeModel
 from .slippage import SlippageModel
 
@@ -84,8 +86,37 @@ class PaperTradingEngine:
                 starting_equity_usd=self.cfg.starting_equity_usd,
                 peak_equity_usd=self.cfg.starting_equity_usd,
             )
+            # Restore the persisted state. Open positions survive a restart, so
+            # equity must too: resetting to starting_equity while a position is
+            # still open books a phantom gain when it closes flat.
+            saved = self.db.get_meta(f"portfolio:{trader}")
+            if saved:
+                try:
+                    d = json.loads(saved)
+                except (TypeError, ValueError):
+                    d = None
+                if isinstance(d, dict):
+                    p.equity_usd = float(d.get("equity_usd", p.equity_usd))
+                    p.realized_pnl_usd = float(d.get("realized_pnl_usd", 0.0))
+                    p.fees_paid_usd = float(d.get("fees_paid_usd", 0.0))
+                    p.n_trades = int(d.get("n_trades", 0))
+                    p.n_wins = int(d.get("n_wins", 0))
+                    p.peak_equity_usd = float(d.get("peak_equity_usd", p.equity_usd))
+                    p.max_drawdown_pct = float(d.get("max_drawdown_pct", 0.0))
             self._portfolios[trader] = p
         return p
+
+    def _persist_portfolio(self, p: ShadowPortfolio) -> None:
+        """Save a portfolio so a restart resumes it instead of resetting to zero."""
+        self.db.set_meta(f"portfolio:{p.trader}", json.dumps({
+            "equity_usd": p.equity_usd,
+            "realized_pnl_usd": p.realized_pnl_usd,
+            "fees_paid_usd": p.fees_paid_usd,
+            "n_trades": p.n_trades,
+            "n_wins": p.n_wins,
+            "peak_equity_usd": p.peak_equity_usd,
+            "max_drawdown_pct": p.max_drawdown_pct,
+        }))
 
     # ------------------------------------------------------------------ fill
     def simulate_fill(
@@ -95,8 +126,29 @@ class PaperTradingEngine:
         amount: float,
         pool_liquidity_usd: Optional[float] = None,
         priority_multiplier: float = 1.0,
+        pool: Optional[PoolState] = None,
+        observed_bps: Optional[float] = None,
     ) -> tuple[float, float, float, float]:
-        """Return (effective_price, slippage_bps, fees_usd, mev_tax_usd)."""
+        """Return (effective_price, slippage_bps, fees_usd, mev_tax_usd).
+
+        When the observed trade carried real extracted reserves (``pool``), price
+        OUR notional on that curve instead of the fitted model — the whole point
+        of decoding the pool is to stop guessing the impact. The fitted model
+        remains the fallback for trades where no usable pool was extracted.
+        """
+        notional = abs(price * amount)
+        basis = "none"
+        if pool is not None:
+            bps, basis = effective_bps(pool, notional, observed_slippage_bps=observed_bps)
+        if basis in ("exact", "estimate"):
+            slip_frac = bps / 10_000.0
+            if side == Side.BUY:
+                eff = price * (1 + slip_frac)
+            else:
+                eff = price * (1 - slip_frac)
+            fee = self.fees.fee_usd(priority_multiplier)
+            mev = notional * (self.slippage.mev_tax_bps / 10_000.0)
+            return max(eff, 1e-18), bps, fee, mev
         f = self.slippage.fill(side, price, amount, pool_liquidity_usd)
         fee = self.fees.fee_usd(priority_multiplier)
         return f.effective_price, f.slippage_bps, fee, f.mev_tax_usd
@@ -113,7 +165,7 @@ class PaperTradingEngine:
             return None
 
         # Model our own latency: we fill at the price *after* the signal ages.
-        price = self._apply_latency(trade.price)
+        price = self._apply_latency(trade.price, trade.side)
 
         port = self.portfolio(trade.trader)
         pos = self.db.get_position(trade.trader, trade.mint)
@@ -122,13 +174,20 @@ class PaperTradingEngine:
             return self._open(trade, price, port, pos, priority_multiplier)
         return self._close(trade, price, port, pos, priority_multiplier)
 
-    def _apply_latency(self, price: float) -> float:
-        """Pessimistic latency: assume the price moved against us while we filled."""
+    def _apply_latency(self, price: float, side: Side) -> float:
+        """Pessimistic latency: assume the price moved against us while we filled.
+
+        Adverse on BOTH sides. Applying ``price * (1 + drift)`` regardless of
+        side is favourable on a sell — the price we receive goes up — so the
+        drift is signed: a buy pays more, a sell receives less.
+        """
         if self.cfg.latency_seconds <= 0:
             return price
-        # Deterministic, side-agnostic adverse drift: we never assume the delay helps.
         drift_bps = min(self.cfg.latency_seconds, 10.0) * 2.0  # ~2 bps per second, capped
-        return price * (1 + drift_bps / 10_000.0)
+        frac = drift_bps / 10_000.0
+        if side == Side.BUY:
+            return price * (1 + frac)
+        return price * (1 - frac)
 
     def _open(
         self,
@@ -200,6 +259,7 @@ class PaperTradingEngine:
         if pnl > 0:
             port.n_wins += 1
         port.mark()
+        self._persist_portfolio(port)
 
         closed = ClosedTrade(
             trader=trade.trader,

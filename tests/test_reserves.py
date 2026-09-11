@@ -265,16 +265,17 @@ def test_effective_bps_is_none_without_a_usable_pool():
 # ------------------------------------------------------- observed slippage
 def test_observed_slippage_is_positive_for_a_buy_above_mid():
     pool = extract_pool_state(_amm_tx(), MINT, SOL_MINT, wallets=[WALLET])
-    mid = pool.mid_price
-    assert observed_slippage_bps(pool, mid * 1.05, side_is_buy=True) == pytest.approx(
+    # Compare in USD: mid_price is quote-per-base, executed_price is USD-per-base.
+    mid_usd = pool.mid_price * pool.quote_usd_price
+    assert observed_slippage_bps(pool, mid_usd * 1.05, side_is_buy=True) == pytest.approx(
         500.0, rel=1e-6
     )
 
 
 def test_observed_slippage_is_positive_for_a_sell_below_mid():
     pool = extract_pool_state(_amm_tx(), MINT, SOL_MINT, wallets=[WALLET])
-    mid = pool.mid_price
-    assert observed_slippage_bps(pool, mid * 0.95, side_is_buy=False) == pytest.approx(
+    mid_usd = pool.mid_price * pool.quote_usd_price
+    assert observed_slippage_bps(pool, mid_usd * 0.95, side_is_buy=False) == pytest.approx(
         500.0, rel=1e-6
     )
 
@@ -283,7 +284,8 @@ def test_observed_slippage_is_never_negative_for_a_favourable_fill():
     # A trader who beat the mid is not credited with negative slippage; the copy
     # model must not inherit a rebate that does not exist.
     pool = extract_pool_state(_amm_tx(), MINT, SOL_MINT, wallets=[WALLET])
-    assert observed_slippage_bps(pool, pool.mid_price * 0.5, side_is_buy=True) == 0.0
+    mid_usd = pool.mid_price * pool.quote_usd_price
+    assert observed_slippage_bps(pool, mid_usd * 0.5, side_is_buy=True) == 0.0
 
 
 # -------------------------------------------------------------------- MEV
@@ -348,7 +350,12 @@ def test_enrich_trade_attaches_real_pool_fees_and_marks_the_basis_exact():
 
 def test_enrich_trade_labels_an_unknown_venue_as_an_estimate():
     tx = _amm_tx(program=UNKNOWN_DEX)
-    t = enrich_trade(tx, _trade(price=1.1e-4, amount=9_090_909.0), wallets=[WALLET])
+    # The price must agree with the transaction's own reserves: an unknown venue
+    # has no curve, so the basis is estimated from the trader's realised slip —
+    # and that is only measurable when the fill actually moved off the mid.
+    pool = extract_pool_state(tx, MINT, SOL_MINT, wallets=[WALLET])
+    mid_usd = pool.mid_price * pool.quote_usd_price
+    t = enrich_trade(tx, _trade(price=mid_usd * 1.02, amount=9_090_909.0), wallets=[WALLET])
     assert t.slippage_basis in {"estimate", "observed"}
     assert t.pool["confidence"] == "estimate"
 

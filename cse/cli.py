@@ -41,7 +41,9 @@ def cmd_discover(args: argparse.Namespace) -> int:
     cfg = load_config()
     db = Database(cfg.db_path)
     disc = TraderDiscovery(cfg, db)
-    result = asyncio.run(disc.discover(limit=args.limit))
+    # --target is the name the README documents; --limit is the older spelling.
+    limit = getattr(args, "target", None) or getattr(args, "limit", None)
+    result = asyncio.run(disc.discover(limit=limit))
     print(json.dumps({
         "discovered": result.total,
         "per_provider": result.per_provider,
@@ -177,6 +179,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = add("discover", cmd_discover, "build the trader pool from leaderboards")
     d.add_argument("--limit", type=int, default=None)
+    # The README documents --target; keep --limit working for existing callers.
+    d.add_argument("--target", type=int, default=None,
+                   help="wallet target (alias of --limit)")
 
     s = add("simulate", cmd_simulate, "replay stored trades through the paper engine")
     s.add_argument("--limit", type=int, default=1000)
@@ -192,7 +197,14 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--top", type=int, default=20)
 
     add("webhook", cmd_webhook, "run the Helius webhook receiver")
-    add("pipeline", cmd_pipeline, "discover -> score -> aggregate")
+    pl = add("pipeline", cmd_pipeline, "discover -> score -> aggregate")
+    # pipeline delegates to cmd_discover/cmd_score/cmd_aggregate/cmd_report, so
+    # it needs every flag those read. Without these the first delegation raised
+    # AttributeError: 'Namespace' object has no attribute 'limit'.
+    pl.add_argument("--limit", type=int, default=None)
+    pl.add_argument("--target", type=int, default=None, help="wallet target (alias of --limit)")
+    pl.add_argument("--top", type=int, default=20)
+    pl.add_argument("--window-hours", type=float, default=24.0)
 
     w = add("watch", cmd_watch, "live: watch wallets and paper-trade every trade")
     w.add_argument("--duration", type=float, default=None, help="stop after N seconds")

@@ -22,7 +22,7 @@ from typing import Callable, Optional
 from .config import Config
 from .db import Database
 from .backfill import Backfiller
-from .guards import KillSwitch
+from .guards import KillSwitch, StalenessGuard
 from .prices import PriceOracle
 from .queue import FetchQueue
 from .rpc import RpcPool, RpcEndpoint, default_endpoints
@@ -286,6 +286,10 @@ async def run_supervisor(
     stop = asyncio.Event()
     restore_signals = _install_signal_handlers(stop)
     bf_task = asyncio.create_task(backfiller.run_forever(watcher.wallets, stop))
+    # The staleness guard was instantiated nowhere, so a silent feed looked
+    # identical to a healthy one. Now it is polled every tick and, on a stall,
+    # engages the kill switch and stops the run.
+    staleness = StalenessGuard(cfg.watch.stale_seconds)
     try:
         while not stop.is_set() and not run_task.done():
             if duration is not None and (time.time() - started) >= duration:
@@ -295,6 +299,12 @@ async def run_supervisor(
             except asyncio.TimeoutError:
                 pass
             db.set_meta("watch_heartbeat", str(time.time()))
+            last_signal = float(db.get_meta("last_signal_at") or 0.0)
+            if staleness.check(last_signal, now=time.time()):
+                log.error("feed stale for %.0fs — engaging kill switch", staleness.stale_for())
+                watcher.kill_switch.engage("feed stale")
+                db.set_meta("killed_at", str(time.time()))
+                break
             if time.time() >= next_maintenance:
                 try:
                     n = rescore(cfg, db)

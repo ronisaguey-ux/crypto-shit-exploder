@@ -32,6 +32,16 @@ class Aggregator:
     def __init__(self, cfg: AggregationConfig):
         self.cfg = cfg
         self._seen: dict[tuple[str, str], float] = {}  # (trader, mint) -> last ts
+        # Bound the dedupe map: one entry per (trader, mint) ever seen grew without
+        # limit for the life of a six-month run. Entries older than the window can
+        # never match again, so they are dropped wholesale once the map is large.
+        self._seen_cap = 100_000
+
+    def _evict_seen(self, now: float) -> None:
+        if len(self._seen) < self._seen_cap:
+            return
+        window = self.cfg.dedupe_window_seconds
+        self._seen = {k: v for k, v in self._seen.items() if (now - v) < window}
 
     # --------------------------------------------------------------- weights
     def weight_of(self, fitness: float, age_seconds: float = 0.0) -> float:
@@ -47,6 +57,7 @@ class Aggregator:
     def is_duplicate(self, signal: Signal, now: Optional[float] = None) -> bool:
         """Same trader, same mint, inside the dedupe window."""
         now = now or signal.created_at
+        self._evict_seen(now)
         key = (signal.trader, signal.mint)
         last = self._seen.get(key)
         if last is not None and (now - last) < self.cfg.dedupe_window_seconds:

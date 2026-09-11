@@ -7,7 +7,11 @@ discovery:
   # connections x 1000 subscriptions.
   target_traders: 5000
   # Provider priority order. First provider that answers wins; the rest are fallbacks.
-  providers: [solanatracker, vybe, birdeye]
+  # `keyless` needs no signup and no key: it seeds the pool from fee-payers of
+  # recent Jupiter/Raydium swaps over the free RPC pool. It yields a small live
+  # pool (default 60 wallets, CSE_KEYLESS_WALLETS to change) and no leaderboard
+  # stats, so it sorts below any keyed provider's output.
+  providers: [solanatracker, vybe, keyless, birdeye]
   # Leaderboard lookback window in days.
   window_days: 30
   # PnL accounting mode for SolanaTracker: strict | adjusted | raw
@@ -57,8 +61,12 @@ scoring:
     max_drawdown: 0.15
   # tanh scale for ratio components (higher = more linear near zero).
   tanh_scale: 2.0
-  # Annualization factor: Solana trades are not daily; 365 * 24 for hourly-ish cadence.
-  annualization: 8760
+  # Annualization for the Sharpe/Sortino components. 1.0 = per-trade, which is
+  # the correct unit here: a "trade" is one round trip, not a day. The old 8760
+  # multiplied every ratio by sqrt(8760) ~ 93.6, so tanh() saturated to ~1.0 for
+  # ANY positive sample mean and 55% of the fitness weight degenerated into a
+  # sign test.
+  annualization: 1.0
 
 aggregation:
   # Only traders with fitness >= this are allowed to emit signals.

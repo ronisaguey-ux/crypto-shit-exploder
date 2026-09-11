@@ -60,13 +60,26 @@ async def webhook(
 ) -> dict[str, Any]:
     cfg, db, engine, agg = _ensure()
     secret = cfg.helius_webhook_secret or os.getenv("HELIUS_WEBHOOK_SECRET", "")
-    if secret and authorization != secret:
+    # The shipped default is `change-me`, and install.sh copies it into .env — so
+    # an unauthenticated-in-practice POST could inject trades and open paper
+    # positions for arbitrary wallets. A sentinel secret is not a secret.
+    if not secret or secret == "change-me":
+        raise HTTPException(
+            status_code=503,
+            detail="webhook secret not configured; set HELIUS_WEBHOOK_SECRET",
+        )
+    import hmac
+
+    if not hmac.compare_digest(authorization or "", secret):
         raise HTTPException(status_code=401, detail="bad webhook auth header")
 
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="invalid JSON") from None
+
+    if not isinstance(payload, (list, dict)):
+        raise HTTPException(status_code=400, detail="payload must be an object or list")
 
     trades = parse_helius_webhook(payload, sol_price_usd=cfg.paper.sol_price_usd)
     trades = filter_tracked(trades, _tracked)
@@ -98,7 +111,9 @@ async def webhook(
 def main() -> None:
     import uvicorn
 
-    host = os.getenv("CSE_WEBHOOK_HOST", "0.0.0.0")
+    # Default to loopback: this endpoint accepts trades and opens paper
+    # positions, so it must not be reachable off-host unless asked for.
+    host = os.getenv("CSE_WEBHOOK_HOST", "127.0.0.1")
     port = int(os.getenv("CSE_WEBHOOK_PORT", "8000"))
     uvicorn.run(app, host=host, port=port)
 

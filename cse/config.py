@@ -32,7 +32,9 @@ def _deep_merge(base: dict, override: dict) -> dict:
 @dataclass
 class DiscoveryConfig:
     target_traders: int = 2000
-    providers: list[str] = field(default_factory=lambda: ["solanatracker", "vybe", "birdeye"])
+    providers: list[str] = field(
+        default_factory=lambda: ["solanatracker", "vybe", "keyless", "birdeye"]
+    )
     window_days: int = 30
     pnl_mode: str = "adjusted"
     page_size: int = 1000
