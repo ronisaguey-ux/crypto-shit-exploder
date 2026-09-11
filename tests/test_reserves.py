@@ -335,7 +335,12 @@ def _trade(price: float, amount: float, side: Side = Side.BUY) -> Trade:
 
 def test_enrich_trade_attaches_real_pool_fees_and_marks_the_basis_exact():
     tx = _amm_tx(fee=25_000)
-    t = enrich_trade(tx, _trade(price=1.1e-4, amount=9_090_909.0),
+    # The price must agree with the transaction's own reserves: a 139x gap is
+    # exactly what assert_slippage_within now refuses (F-022 had this fixture
+    # passing a price inconsistent with its own tx, hiding the unit bug).
+    pool = extract_pool_state(tx, MINT, SOL_MINT, wallets=[WALLET])
+    mid_usd = pool.mid_price * pool.quote_usd_price
+    t = enrich_trade(tx, _trade(price=mid_usd * 1.005, amount=9_090_909.0),
                      wallets=[WALLET], sol_price_usd=SOL_PRICE)
     assert t.dex == "raydium_amm"
     assert t.slippage_basis == "exact"

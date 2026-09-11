@@ -434,8 +434,32 @@ def detect_mev(tx: dict, slot_swaps: list[dict]) -> MevInfo:
 
 
 # ------------------------------------------------------------------ reporting
+def assert_slippage_within(
+    intended_price: float, mark_price: float, max_bps: float = 500.0
+) -> None:
+    """Reject a decoded price that is implausibly far from the pool's mark.
+
+    The reserves decoder computes slippage but never refuses a fill, so a trade
+    whose decoded price is an order of magnitude off the pool mid (a mis-signed
+    balance delta, the wrong vault picked, a fee-inclusive leg) was accepted and
+    paper-filled as if it were real. This is the gate that rejects it.
+
+    Uses a relative-to-max denominator so a zero or negative mark fails closed
+    instead of raising ZeroDivisionError.
+    """
+    if max_bps <= 0:
+        raise ValueError("max_bps must be > 0")
+    denom = max(abs(mark_price), 1e-9)
+    if abs(intended_price - mark_price) / denom > max_bps / 10_000.0:
+        raise ValueError(
+            f"price deviates beyond slippage limit: "
+            f"intended={intended_price!r} mark={mark_price!r} max_bps={max_bps!r}"
+        )
+
+
 def enrich_trade(tx: dict, trade, *, wallets: Optional[Iterable[str]] = None,
-                 sol_price_usd: float = 150.0, quote_mint: str = SOL_MINT):
+                 sol_price_usd: float = 150.0, quote_mint: str = SOL_MINT,
+                 max_price_deviation_bps: float = 500.0):
     """Attach real pool depth, exact slippage and real fees to a decoded Trade.
 
     Mutates ``trade`` in place and returns it. Prices only get *better* grounded:
@@ -450,6 +474,11 @@ def enrich_trade(tx: dict, trade, *, wallets: Optional[Iterable[str]] = None,
 
     if pool.usable:
         trade.pool_liquidity_usd = pool.quote_depth_usd
+        # Refuse an implausible fill before any of it reaches the paper engine.
+        # The mark is quote-per-base, so convert it to USD to match trade.price.
+        mark_usd = pool.mid_price * pool.quote_usd_price
+        if mark_usd > 0 and trade.price > 0:
+            assert_slippage_within(trade.price, mark_usd, max_bps=max_price_deviation_bps)
 
     observed = observed_slippage_bps(pool, trade.price, trade.side.value == "buy")
     notional = trade.notional_usd
