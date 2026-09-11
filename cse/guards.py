@@ -133,22 +133,48 @@ class StalenessGuard:
 
 @dataclass
 class DrawdownGuard:
-    """Trips when a shadow portfolio gives back too much of its peak."""
+    """Trips when a shadow portfolio gives back too much of its peak.
+
+    Two barriers, OR-ed, ported from oculus's RiskManager (docs/OCULUS_PORTS.md
+    item 3): drawdown from the all-time peak, and drawdown from the session open.
+    The session base is what stops a slow bleed being invisible — a portfolio can
+    sit 2% under its peak forever while losing 5% every session.
+
+    The session date is tracked explicitly so a shortened session (or a process
+    restarted mid-day) resets the daily barrier rather than inheriting a stale
+    one from yesterday.
+    """
 
     limit_pct: float = 0.5
+    daily_limit_pct: float = 0.0  # 0 disables the session barrier
     peak: float = 0.0
+    session_open: float = 0.0
     tripped: bool = False
     tripped_at: Optional[float] = None
     _started: bool = False
+    _session_date: str = ""
 
-    def update(self, equity: float) -> bool:
-        if equity > self.peak or not self._started:
+    def _roll_session(self, now: Optional[float] = None) -> None:
+        day = time.strftime("%Y-%m-%d", time.gmtime(now if now is not None else time.time()))
+        if day != self._session_date:
+            self._session_date = day
+            self.session_open = 0.0  # re-seeded from the first equity of the day
+
+    def update(self, equity: float, now: Optional[float] = None) -> bool:
+        self._roll_session(now)
+        if not self._started or equity > self.peak:
             self.peak = equity
             self._started = True
-        if self.peak <= 0:
+        if self.session_open <= 0:
+            self.session_open = equity
+        if self.peak <= 0 or self.session_open <= 0:
             return False
-        dd = (self.peak - equity) / self.peak
-        if dd >= self.limit_pct and not self.tripped:
+        dd_peak = (self.peak - equity) / self.peak
+        dd_day = max(0.0, (self.session_open - equity) / self.session_open)
+        # `>= 0.0` is always true, so a disabled daily barrier must be skipped
+        # explicitly rather than compared.
+        daily_breach = self.daily_limit_pct > 0 and dd_day >= self.daily_limit_pct
+        if not self.tripped and (dd_peak >= self.limit_pct or daily_breach):
             self.tripped = True
             self.tripped_at = time.time()
         return self.tripped
@@ -156,7 +182,10 @@ class DrawdownGuard:
     def to_dict(self) -> dict:
         return {
             "limit_pct": self.limit_pct,
+            "daily_limit_pct": self.daily_limit_pct,
             "peak": round(self.peak, 4),
+            "session_open": round(self.session_open, 4),
+            "session_date": self._session_date,
             "tripped": self.tripped,
             "tripped_at": self.tripped_at,
         }
