@@ -245,13 +245,19 @@ class PaperTradingEngine:
     ) -> Optional[ClosedTrade]:
         if pos is None:
             return None  # nothing to sell
+        # Size the exit by what the tracked wallet actually sold, not by the whole
+        # position. A SELL of half the position used to close all of it (F-020),
+        # which books a round trip the trader never took.
+        sell_amount = trade.amount if 0 < trade.amount <= pos.amount else pos.amount
+        partial = sell_amount < pos.amount
         eff_price, slip_bps, fee, mev = self.simulate_fill(
-            Side.SELL, price, pos.amount, trade.pool_liquidity_usd, priority_multiplier
+            Side.SELL, price, sell_amount, trade.pool_liquidity_usd, priority_multiplier
         )
-        proceeds = pos.amount * eff_price
+        entry_fees_share = pos.entry_fees_usd * (sell_amount / pos.amount) if pos.amount else 0.0
+        proceeds = sell_amount * eff_price
         exit_costs = fee + mev
-        pnl = proceeds - exit_costs - (pos.amount * pos.entry_price) - pos.entry_fees_usd
-        cost_basis = pos.amount * pos.entry_price + pos.entry_fees_usd
+        pnl = proceeds - exit_costs - (sell_amount * pos.entry_price) - entry_fees_share
+        cost_basis = sell_amount * pos.entry_price + entry_fees_share
 
         port.equity_usd += proceeds - exit_costs
         port.realized_pnl_usd += pnl
@@ -267,16 +273,22 @@ class PaperTradingEngine:
             mint=trade.mint,
             entry_price=pos.entry_price,
             exit_price=eff_price,
-            amount=pos.amount,
+            amount=sell_amount,
             pnl_usd=pnl,
             pnl_pct=(pnl / cost_basis) if cost_basis else 0.0,
-            fees_usd=pos.entry_fees_usd + exit_costs,
+            fees_usd=entry_fees_share + exit_costs,
             hold_seconds=max(0.0, (trade.observed_at or time.time()) - pos.opened_at),
             opened_at=pos.opened_at,
             closed_at=trade.observed_at or time.time(),
         )
         self.db.close_trade(closed)
-        self.db.delete_position(trade.trader, trade.mint)
+        if partial:
+            # Keep the remainder open with its share of the entry fees still on it.
+            pos.amount -= sell_amount
+            pos.entry_fees_usd -= entry_fees_share
+            self.db.open_position(pos)
+        else:
+            self.db.delete_position(trade.trader, trade.mint)
         self.db.insert_trade(_simulated(trade, eff_price, slip_bps, fee, mev))
         return closed
 
