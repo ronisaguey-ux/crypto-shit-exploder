@@ -292,6 +292,24 @@ class PaperTradingEngine:
         self.db.insert_trade(_simulated(trade, eff_price, slip_bps, fee, mev))
         return closed
 
+    def should_exit(self, trader: str, mint: str, price: float,
+                    drawdown: Optional["DrawdownGuard"] = None) -> tuple[bool, str]:
+        """Decide whether an exit should actually fire, and why.
+
+        Ported in shape from oculus's ExitLogicDispatcher (docs/OCULUS_PORTS.md
+        item 4): the guard is consulted BEFORE the exit runs, and its verdict is
+        returned rather than raised, so the caller can log a reason. Returns
+        (allowed, reason).
+        """
+        pos = self.db.get_position(trader, mint)
+        if pos is None:
+            return False, "no open position"
+        if price <= 0:
+            return False, "no usable price"
+        if drawdown is not None and drawdown.tripped:
+            return False, f"drawdown guard tripped ({drawdown.to_dict().get('peak')})"
+        return True, "ok"
+
     def mark_to_market(self, trader: str, mint: str, price: float) -> float:
         """Unrealized PnL on an open position at ``price``, in USD.
 
