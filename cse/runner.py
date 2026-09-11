@@ -22,7 +22,7 @@ from typing import Callable, Optional
 from .config import Config
 from .db import Database
 from .backfill import Backfiller
-from .guards import KillSwitch, StalenessGuard
+from .guards import CircuitBreaker, DrawdownGuard, KillSwitch, StalenessGuard
 from .prices import PriceOracle
 from .queue import FetchQueue
 from .rpc import RpcPool, RpcEndpoint, default_endpoints
@@ -290,6 +290,7 @@ async def run_supervisor(
     # identical to a healthy one. Now it is polled every tick and, on a stall,
     # engages the kill switch and stops the run.
     staleness = StalenessGuard(cfg.watch.stale_seconds)
+    drawdown = DrawdownGuard(limit_pct=cfg.paper.starting_equity_usd and 0.5 or 0.5)
     try:
         while not stop.is_set() and not run_task.done():
             if duration is not None and (time.time() - started) >= duration:
@@ -299,6 +300,18 @@ async def run_supervisor(
             except asyncio.TimeoutError:
                 pass
             db.set_meta("watch_heartbeat", str(time.time()))
+            # Drawdown guard was instantiated nowhere (F-013), so a shadow
+            # portfolio could give back its whole peak and the run kept going.
+            for p in watcher.engine.summary():
+                if drawdown.update(float(p.get("equity_usd") or 0.0)):
+                    log.error("drawdown %.1f%% on %s — engaging kill switch",
+                              drawdown.limit_pct * 100, p.get("trader"))
+                    watcher.kill.engage("drawdown")
+                    db.set_meta("killed_at", str(time.time()))
+                    stop.set()
+                    break
+            if stop.is_set():
+                break
             last_signal = float(db.get_meta("last_signal_at") or 0.0)
             if staleness.check(last_signal, now=time.time()):
                 log.error("feed stale for %.0fs — engaging kill switch", staleness.stale_for())
