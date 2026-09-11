@@ -42,6 +42,31 @@ QUOTE_MINTS = STABLE_MINTS | {SOL_MINT}
 MIN_TRADE_USD = 1.0
 
 
+def _raw_amount(entry: dict[str, Any]) -> int:
+    """Raw base-unit amount from a token-balance entry, as an exact integer.
+
+    ``uiAmount`` is a float and a lossy one for large balances; ``amount`` is the
+    raw u64 as a decimal string. Reserve maths uses this so the integer value
+    never round-trips through a float.
+    """
+    amt = entry.get("uiTokenAmount") or {}
+    raw = amt.get("amount")
+    if raw is None:
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _decimals(entry: dict[str, Any]) -> int:
+    amt = entry.get("uiTokenAmount") or {}
+    try:
+        return int(amt.get("decimals", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _ui_amount(entry: dict[str, Any]) -> float:
     """UI amount from a token-balance entry, tolerating a missing uiAmount."""
     amt = entry.get("uiTokenAmount") or {}

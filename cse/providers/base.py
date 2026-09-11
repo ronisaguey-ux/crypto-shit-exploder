@@ -29,7 +29,7 @@ class Provider:
     def __init__(
         self,
         api_key: str = "",
-        timeout: float = 30.0,
+        timeout: float = 1.5,
         max_retries: int = 3,
         client: Optional[httpx.AsyncClient] = None,
     ):
@@ -38,6 +38,11 @@ class Provider:
         self.max_retries = max_retries
         self._client = client
         self._owns_client = client is None
+        #: Consecutive failures before this provider is parked, and for how long.
+        self.breaker_threshold = 3
+        self.breaker_cooldown = 60.0
+        self._breaker_failures = 0
+        self._breaker_until = 0.0
 
     # ------------------------------------------------------------------ http
     def _headers(self) -> dict[str, str]:
@@ -57,15 +62,51 @@ class Provider:
             return self._client, False
         return httpx.AsyncClient(timeout=self.timeout), True
 
+    # ------------------------------------------------------------- breaker
+    def _breaker_open(self) -> bool:
+        """True while this provider is parked after consecutive failures.
+
+        A provider that is down used to be retried on every call, so one dead
+        endpoint cost the caller a full timeout budget each time it was asked.
+        Consecutive failures now park it for a cooldown; the caller moves on to
+        the next provider immediately instead of paying the same 1.5s three
+        times over.
+        """
+        if self._breaker_until <= 0:
+            return False
+        if time.monotonic() >= self._breaker_until:
+            self._breaker_until = 0.0
+            self._breaker_failures = 0
+            return False
+        return True
+
+    def _breaker_record(self, ok: bool) -> None:
+        if ok:
+            self._breaker_failures = 0
+            self._breaker_until = 0.0
+            return
+        self._breaker_failures += 1
+        if self._breaker_failures >= self.breaker_threshold:
+            self._breaker_until = time.monotonic() + self.breaker_cooldown
+            log.warning(
+                "%s parked for %.0fs after %d consecutive failures",
+                self.name, self.breaker_cooldown, self._breaker_failures,
+            )
+
     async def _get(self, path: str, params: Optional[dict[str, Any]] = None) -> Any:
+        if self._breaker_open():
+            raise ProviderError(f"{self.name} breaker open (parked after repeated failures)")
         client, created = await self._client_or_new()
         url = path if path.startswith("http") else f"{self.base_url}{path}"
         last: Optional[Exception] = None
         try:
             for attempt in range(self.max_retries):
                 try:
-                    resp = await client.get(
-                        url, params=self._params(params), headers=self._headers()
+                    resp = await asyncio.wait_for(
+                        client.get(
+                            url, params=self._params(params), headers=self._headers()
+                        ),
+                        timeout=self.timeout,
                     )
                     if resp.status_code == 429:
                         wait = float(resp.headers.get("retry-after", 2 ** attempt))
@@ -76,11 +117,13 @@ class Provider:
                         raise ProviderError(
                             f"{self.name} HTTP {resp.status_code}: {resp.text[:200]}"
                         )
+                    self._breaker_record(True)
                     return resp.json()
-                except (httpx.HTTPError, ProviderError) as e:
+                except (httpx.HTTPError, ProviderError, asyncio.TimeoutError) as e:
                     last = e
                     if attempt < self.max_retries - 1:
                         await asyncio.sleep(0.5 * (2 ** attempt))
+            self._breaker_record(False)
             raise ProviderError(f"{self.name} failed after {self.max_retries} tries: {last}")
         finally:
             if created:

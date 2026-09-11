@@ -29,6 +29,8 @@ from .swapdecode import (
     SOL_MINT,
     STABLE_MINTS,
     _account_keys,
+    _decimals,
+    _raw_amount,
     _ui_amount,
 )
 
@@ -118,6 +120,13 @@ class PoolState:
     reserve_base: float = 0.0
     #: UI units of the quote asset on the market side, after the trade.
     reserve_quote: float = 0.0
+    #: Raw base-unit (u64) reserves. These are the exact on-chain integers and
+    #: are what the curve maths must use; the UI floats above are derived.
+    reserve_base_raw: int = 0
+    reserve_quote_raw: int = 0
+    #: Decimal scaling of each raw reserve, so raw -> UI stays lossless.
+    base_decimals: int = 0
+    quote_decimals: int = 0
     #: USD value of the quote-side reserve — the depth impact is measured against.
     quote_depth_usd: float = 0.0
     #: Both sides of the pool in USD, for reporting.
@@ -222,6 +231,40 @@ def extract_execution(tx: dict, *, sol_price_usd: float = 150.0) -> ExecutionInf
 
 
 # -------------------------------------------------------------------- reserves
+def _market_side_raw(meta: dict, mint: str, tracked: set[str]) -> tuple[int, int]:
+    """Raw (u64) reserve of ``mint`` on the market side, plus its decimals.
+
+    Mirrors :func:`_market_side` but keeps the integer value intact, so the
+    bonding-curve maths never touches a float until the very last conversion.
+    Returns ``(raw_total, decimals)``.
+    """
+    pre: dict[int, int] = {}
+    post: dict[int, tuple[Optional[str], int]] = {}
+    decimals = 0
+    for key, is_post in (("preTokenBalances", False), ("postTokenBalances", True)):
+        for entry in meta.get(key) or []:
+            if entry.get("mint") != mint:
+                continue
+            idx = entry.get("accountIndex")
+            if idx is None:
+                continue
+            raw = _raw_amount(entry)
+            if is_post:
+                post[idx] = (entry.get("owner"), raw)
+                if not decimals:
+                    decimals = _decimals(entry)
+            else:
+                pre[idx] = raw
+    total = 0
+    for idx, (owner, after) in post.items():
+        if owner in tracked:
+            continue
+        if after == pre.get(idx, 0):
+            continue  # untouched holder, not part of this trade's market
+        total += after
+    return total, decimals
+
+
 def _market_side(meta: dict, mint: str, tracked: set[str]) -> float:
     """Reserve of ``mint`` on the market side of the trade.
 
@@ -289,8 +332,17 @@ def extract_pool_state(
     if reserve_base <= 0 or reserve_quote <= 0:
         return state
 
+    # Raw u64 reserves are the source of truth; the UI floats are derived from
+    # them so the curve maths and the reported numbers cannot disagree.
+    base_raw, base_dec = _market_side_raw(meta, mint, tracked)
+    quote_raw, quote_dec = _market_side_raw(meta, quote_mint, tracked)
+
     state.reserve_base = reserve_base
     state.reserve_quote = reserve_quote
+    state.reserve_base_raw = base_raw
+    state.reserve_quote_raw = quote_raw
+    state.base_decimals = base_dec
+    state.quote_decimals = quote_dec
     state.mid_price = reserve_quote / reserve_base
 
     depth = _quote_usd(quote_mint, reserve_quote, sol_price_usd)
@@ -310,16 +362,75 @@ def extract_pool_state(
 
 
 # ------------------------------------------------------------------ AMM maths
+def _ceil_div(numerator: int, denominator: int) -> int:
+    """Integer ceiling division. denominator must be > 0."""
+    return -(-numerator // denominator)
+
+
+def constant_product_out_exact(
+    reserve_in: int, reserve_out: int, amount_in: int, fee_bps: float = 0.0
+) -> int:
+    """Exact x*y=k output in raw integer units, rounding in the pool's favour.
+
+    This is the on-chain formula, in integers end to end. The float version
+    below is kept for callers holding already-scaled UI amounts, but anything
+    derived from lamports must go through here: converting a u64 balance to a
+    float first loses the low bits, and across a bonding curve those losses
+    accumulate into a reserve that no longer matches the chain.
+    """
+    if reserve_in <= 0 or reserve_out <= 0 or amount_in <= 0:
+        return 0
+    if fee_bps > 0:
+        # fee is taken in integer basis points, rounded up like the programs do.
+        fee = _ceil_div(int(round(amount_in * fee_bps)), 10_000)
+        amount_in = amount_in - fee
+    if amount_in <= 0:
+        return 0
+    # out = reserve_out * amount_in / (reserve_in + amount_in), ceil-rounded so
+    # the pool never pays out a lamport more than the invariant allows.
+    numerator = reserve_out * amount_in
+    denominator = reserve_in + amount_in
+    if denominator <= 0:
+        return 0
+    return _ceil_div(numerator, denominator)
+
+
 def constant_product_out(
     reserve_in: float, reserve_out: float, amount_in: float, fee_bps: float = 0.0
 ) -> float:
-    """Exact x*y=k output for an input, net of the venue fee."""
+    """Exact x*y=k output for an input, net of the venue fee (UI-unit float).
+
+    Prefer :func:`constant_product_out_exact` when the inputs are raw integer
+    balances; this wrapper exists for the UI-denominated path and for tests.
+    """
     if reserve_in <= 0 or reserve_out <= 0 or amount_in <= 0:
         return 0.0
     net_in = amount_in * (1.0 - fee_bps / 10_000.0)
     if net_in <= 0:
         return 0.0
     return reserve_out * net_in / (reserve_in + net_in)
+
+
+def price_impact_bps_exact(
+    reserve_in: int, reserve_out: int, amount_in: int, fee_bps: float = 0.0
+) -> float:
+    """Price impact of ``amount_in`` in integer space, reported in bps.
+
+    Integer arithmetic throughout: the only float is the final bps ratio, so
+    the impact itself carries no accumulated rounding error.
+    """
+    if reserve_in <= 0 or reserve_out <= 0 or amount_in <= 0:
+        return 0.0
+    out = constant_product_out_exact(reserve_in, reserve_out, amount_in, fee_bps=0.0)
+    if out <= 0:
+        return 0.0
+    # mid = reserve_out / reserve_in ; avg = out / amount_in
+    # impact = (mid/avg - 1) = (reserve_out*amount_in) / (reserve_in*out) - 1
+    num = reserve_out * amount_in
+    den = reserve_in * out
+    if den <= 0:
+        return 0.0
+    return max(0.0, (num / den - 1.0) * 10_000.0)
 
 
 def price_impact_bps(
@@ -360,6 +471,20 @@ def effective_bps(
         return 0.0, "none"
 
     if pool.model == "constant_product":
+        # Prefer the raw-integer curve when both raw reserves are present: it is
+        # the exact on-chain formula. Fall back to the UI-float walk only when a
+        # transaction carried no raw amounts.
+        if pool.reserve_base_raw > 0 and pool.reserve_quote_raw > 0:
+            # notional_usd is a USD size; scale it into raw quote units using the
+            # observed quote depth, then walk the integer curve.
+            quote_ui = pool.reserve_quote
+            if quote_ui > 0:
+                amount_in_raw = int(notional_usd / pool.quote_usd_price) if pool.quote_usd_price else 0
+                if amount_in_raw > 0:
+                    impact = price_impact_bps_exact(
+                        pool.reserve_quote_raw, pool.reserve_base_raw, amount_in_raw, fee_bps=0.0
+                    )
+                    return impact + pool.fee_bps, "exact"
         impact = price_impact_bps(
             pool.quote_depth_usd, pool.reserve_base, notional_usd, fee_bps=0.0
         )

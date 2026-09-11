@@ -212,18 +212,156 @@ def _apply_env(cfg: Config) -> Config:
     return cfg
 
 
+class ConfigError(ValueError):
+    """Raised when a config value is out of range or internally inconsistent.
+
+    The engine used to accept any dict it was handed, so a negative slippage
+    limit or an empty RPC pool parsed clean and only failed hours later on the
+    wire. Every such value now fails at load, before a socket is opened.
+    """
+
+
+#: Public RPC endpoints throttle hard. Silently falling back to one when no
+#: private endpoint is configured produces an engine that starts "fine" and then
+#: 429s itself into uselessness; the fallback is refused instead.
+_PUBLIC_RPC_HOSTS = {
+    "api.mainnet-beta.solana.com",
+    "api.devnet.solana.com",
+    "api.testnet.solana.com",
+}
+
+
+def _require(cond: bool, msg: str) -> None:
+    if not cond:
+        raise ConfigError(msg)
+
+
+def _validate_endpoint(url: str) -> None:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    _require(
+        parsed.scheme in ("http", "https", "ws", "wss") and bool(parsed.netloc),
+        f"rpc endpoint is not a valid URL: {url!r}",
+    )
+
+
+def validate_config(cfg: Config) -> Config:
+    """Fail-fast schema and range validation. Raises ConfigError on any breach."""
+    d, p, a, r, w = (
+        cfg.discovery,
+        cfg.paper,
+        cfg.aggregation,
+        cfg.rpc,
+        cfg.watch,
+    )
+
+    # --- discovery ---
+    _require(d.target_traders > 0, f"discovery.target_traders must be > 0, got {d.target_traders}")
+    _require(d.window_days > 0, f"discovery.window_days must be > 0, got {d.window_days}")
+    _require(d.page_size > 0, f"discovery.page_size must be > 0, got {d.page_size}")
+    _require(d.min_volume_usd >= 0, "discovery.min_volume_usd must be >= 0")
+    _require(d.min_trades >= 0, "discovery.min_trades must be >= 0")
+
+    # --- paper ---
+    _require(p.starting_equity_usd > 0, "paper.starting_equity_usd must be > 0")
+    _require(0 < p.position_pct <= 1, f"paper.position_pct must be in (0, 1], got {p.position_pct}")
+    _require(p.slippage_bps >= 0, f"paper.slippage_bps must be >= 0, got {p.slippage_bps}")
+    _require(
+        p.slippage_bps <= 10_000,
+        f"paper.slippage_bps must be <= 10000 (100%), got {p.slippage_bps}",
+    )
+    _require(len(p.slippage_jitter) == 2, "paper.slippage_jitter must be [low, high]")
+    _require(
+        0 <= p.slippage_jitter[0] <= p.slippage_jitter[1],
+        f"paper.slippage_jitter must be ascending and non-negative, got {p.slippage_jitter}",
+    )
+    _require(p.latency_seconds >= 0, "paper.latency_seconds must be >= 0")
+    _require(0 <= p.mev_tax_bps <= 10_000, f"paper.mev_tax_bps must be in [0, 10000], got {p.mev_tax_bps}")
+    _require(p.base_fee_lamports >= 0, "paper.base_fee_lamports must be >= 0")
+    _require(p.priority_fee_lamports >= 0, "paper.priority_fee_lamports must be >= 0")
+    _require(p.lamports_per_sol > 0, "paper.lamports_per_sol must be > 0")
+    _require(p.sol_price_usd > 0, f"paper.sol_price_usd must be > 0, got {p.sol_price_usd}")
+    _require(
+        0 < p.max_liquidity_impact_pct <= 1,
+        f"paper.max_liquidity_impact_pct must be in (0, 1], got {p.max_liquidity_impact_pct}",
+    )
+
+    # --- aggregation ---
+    _require(a.min_fitness >= 0, "aggregation.min_fitness must be >= 0")
+    _require(0 <= a.confidence_threshold <= 1, "aggregation.confidence_threshold must be in [0, 1]")
+    _require(a.weight_power > 0, "aggregation.weight_power must be > 0")
+    _require(a.signal_half_life_hours > 0, "aggregation.signal_half_life_hours must be > 0")
+    _require(a.max_open_positions > 0, "aggregation.max_open_positions must be > 0")
+
+    # --- rpc ---
+    _require(r.timeout > 0, f"rpc.timeout must be > 0, got {r.timeout}")
+    _require(r.concurrency > 0, f"rpc.concurrency must be > 0, got {r.concurrency}")
+    _require(r.public_rps > 0, "rpc.public_rps must be > 0")
+    _require(r.public_heavy_rps > 0, "rpc.public_heavy_rps must be > 0")
+    for url in r.endpoints:
+        _validate_endpoint(url)
+        host = url.split("://", 1)[-1].split("/", 1)[0]
+        _require(
+            host not in _PUBLIC_RPC_HOSTS,
+            f"rpc.endpoints must not list a public throttled endpoint ({host}); "
+            "set a private RPC URL or leave it empty",
+        )
+
+    # --- watch ---
+    _require(w.queue_size > 0, "watch.queue_size must be > 0")
+    _require(w.queue_max_pending > 0, "watch.queue_max_pending must be > 0")
+    _require(w.workers > 0, f"watch.workers must be > 0, got {w.workers}")
+    _require(w.stale_after_seconds > 0, "watch.stale_after_seconds must be > 0")
+    _require(w.refresh_seconds > 0, "watch.refresh_seconds must be > 0")
+    _require(w.price_ttl_seconds > 0, "watch.price_ttl_seconds must be > 0")
+    _require(w.maintenance_seconds > 0, "watch.maintenance_seconds must be > 0")
+    _require(w.queue_retention_hours >= 0, "watch.queue_retention_hours must be >= 0")
+    _require(w.commitment in ("processed", "confirmed", "finalized"),
+             f"watch.commitment must be processed|confirmed|finalized, got {w.commitment!r}")
+    for ep in w.ws_endpoints:
+        _require(isinstance(ep, dict) and ep.get("url"), f"watch.ws_endpoints entry needs a url: {ep!r}")
+        _validate_endpoint(str(ep["url"]))
+
+    # --- credentials / paths ---
+    _require(bool(cfg.db_path), "db_path must not be empty")
+    _require(
+        cfg.helius_webhook_secret != "change-me",
+        "helius_webhook_secret is still the shipped sentinel 'change-me'; "
+        "set a real secret or the webhook will refuse every request",
+    )
+
+    # --- scoring ---
+    _require(cfg.scoring.min_trades >= 0, "scoring.min_trades must be >= 0")
+    _require(cfg.scoring.tanh_scale > 0, "scoring.tanh_scale must be > 0")
+    _require(cfg.scoring.annualization > 0, "scoring.annualization must be > 0")
+    if cfg.scoring.weights:
+        _require(
+            all(v >= 0 for v in cfg.scoring.weights.values()),
+            "scoring.weights must all be non-negative",
+        )
+    return cfg
+
+
 def load_config(path: Optional[str | Path] = None) -> Config:
     path = Path(path or os.getenv("CSE_CONFIG_PATH") or DEFAULT_CONFIG)
     raw: dict[str, Any] = {}
     if path.exists():
         raw = yaml.safe_load(path.read_text()) or {}
 
-    cfg = Config(
-        discovery=DiscoveryConfig(**(raw.get("discovery") or {})),
-        paper=PaperConfig(**(raw.get("paper") or {})),
-        scoring=ScoringConfig(**(raw.get("scoring") or {})),
-        aggregation=AggregationConfig(**(raw.get("aggregation") or {})),
-        rpc=RpcConfig(**(raw.get("rpc") or {})),
-        watch=WatchConfig(**(raw.get("watch") or {})),
-    )
-    return _apply_env(cfg)
+    try:
+        cfg = Config(
+            discovery=DiscoveryConfig(**(raw.get("discovery") or {})),
+            paper=PaperConfig(**(raw.get("paper") or {})),
+            scoring=ScoringConfig(**(raw.get("scoring") or {})),
+            aggregation=AggregationConfig(**(raw.get("aggregation") or {})),
+            rpc=RpcConfig(**(raw.get("rpc") or {})),
+            watch=WatchConfig(**(raw.get("watch") or {})),
+        )
+    except TypeError as exc:
+        # An unknown key in config.yaml used to be silently ignored; it is a typo
+        # that means the operator's intended setting never applied.
+        raise ConfigError(f"config has an unknown or misplaced key: {exc}") from exc
+
+    cfg = _apply_env(cfg)
+    return validate_config(cfg)

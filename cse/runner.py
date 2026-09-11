@@ -197,6 +197,29 @@ def _install_signal_handlers(stop: asyncio.Event) -> Callable[[], None]:
     return restore
 
 
+def _supervise_task(task: asyncio.Task, name: str) -> None:
+    """Attach a done-callback so a dead worker is loud, not silent.
+
+    ``asyncio.create_task`` holds no reference and reports nothing: an exception
+    inside the coroutine is swallowed until the task is awaited, which for a
+    fire-and-forget worker means never. A worker that dies then looks exactly
+    like a quiet market. This logs the exception (and whether it was cancelled)
+    the moment the task ends, so the failure reaches the log instead of vanishing.
+    """
+
+    def _done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            log.info("worker %s cancelled", name)
+            return
+        exc = t.exception()
+        if exc is not None:
+            log.error("worker %s died: %r", name, exc, exc_info=exc)
+        else:
+            log.warning("worker %s exited cleanly (unexpected)", name)
+
+    task.add_done_callback(_done)
+
+
 async def run_watch(
     cfg: Config,
     db: Database,
@@ -218,6 +241,8 @@ async def run_watch(
     restore_signals = _install_signal_handlers(stop)
     bf_task = asyncio.create_task(backfiller.run_forever(watcher.wallets, stop))
     run_task = asyncio.create_task(watcher.run())
+    _supervise_task(bf_task, "backfiller")
+    _supervise_task(run_task, "watcher")
     started = time.time()
     deadline = None if duration is None else started + duration
     try:

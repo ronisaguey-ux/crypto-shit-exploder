@@ -371,3 +371,75 @@ def test_enrich_trade_says_none_rather_than_inventing_a_number():
     t = enrich_trade(tx, _trade(price=1.1e-4, amount=9_090_909.0), wallets=[WALLET])
     assert t.slippage_basis == "none"
     assert t.slippage_bps == 0.0
+
+
+# --- audit FINDING-002: exact integer curve, no float drift ------------------
+
+def test_exact_integer_curve_matches_float_on_small_values():
+    from cse.reserves import constant_product_out, constant_product_out_exact
+
+    ri, ro, ain = 1_000_000, 2_000_000, 1_234
+    exact = constant_product_out_exact(ri, ro, ain)
+    approx = constant_product_out(ri, ro, ain)
+    assert abs(exact - approx) <= 1
+    assert exact == 2465
+
+
+def test_exact_integer_curve_rounds_in_pool_favour():
+    from cse.reserves import constant_product_out_exact
+
+    # ceil division: 3*1/(1+1) = 1.5 -> 2, never 1
+    assert constant_product_out_exact(1, 3, 1) == 2
+
+
+def test_exact_integer_curve_no_drift_over_many_steps():
+    """The float path drifts on a bonding curve; the integer path cannot."""
+    from cse.reserves import constant_product_out_exact
+
+    x, y = 30_000_000_000, 1_073_000_000_000_000
+    xf, yf = float(x), float(y)
+    for _ in range(500):
+        out_i = constant_product_out_exact(x, y, 1_000_000)
+        out_f = yf * (1_000_000 * (1 - 0.01)) / (xf + 1_000_000 * (1 - 0.01))
+        x += 1_000_000
+        y -= out_i
+        xf += 1_000_000
+        yf -= out_f
+    # integer reserve stays integral; float reserve has lost low bits
+    assert isinstance(y, int)
+    assert y == int(y)
+    assert y > 0
+
+
+def test_price_impact_bps_exact_is_integer_clean():
+    from cse.reserves import price_impact_bps_exact
+
+    bps = price_impact_bps_exact(1_000_000_000, 1_000_000_000, 1_000_000)
+    assert 0 < bps < 200  # ~1% on a 0.1% pool share
+
+
+def test_pool_state_carries_raw_reserves():
+    from cse.reserves import extract_pool_state
+
+    tx = {
+        "transaction": {"message": {"accountKeys": ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"]}},
+        "meta": {
+            "preTokenBalances": [
+                {"accountIndex": 1, "mint": "MINT", "owner": "pool",
+                 "uiTokenAmount": {"amount": "1000000", "decimals": 6, "uiAmount": 1.0}},
+                {"accountIndex": 2, "mint": "So11111111111111111111111111111111111111112", "owner": "pool",
+                 "uiTokenAmount": {"amount": "2000000000", "decimals": 9, "uiAmount": 2.0}},
+            ],
+            "postTokenBalances": [
+                {"accountIndex": 1, "mint": "MINT", "owner": "pool",
+                 "uiTokenAmount": {"amount": "1100000", "decimals": 6, "uiAmount": 1.1}},
+                {"accountIndex": 2, "mint": "So11111111111111111111111111111111111111112", "owner": "pool",
+                 "uiTokenAmount": {"amount": "1900000000", "decimals": 9, "uiAmount": 1.9}},
+            ],
+        },
+    }
+    st = extract_pool_state(tx, "MINT", "So11111111111111111111111111111111111111112")
+    assert st.reserve_base_raw == 1_100_000
+    assert st.reserve_quote_raw == 1_900_000_000
+    assert st.base_decimals == 6
+    assert st.quote_decimals == 9

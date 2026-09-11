@@ -18,5 +18,35 @@ KillSignal=SIGINT
 StandardOutput=append:%h/Roni_workspace/crypto_shit_exploder/data/cse.log
 StandardError=append:%h/Roni_workspace/crypto_shit_exploder/data/cse.log
 
+# --- Hardening -------------------------------------------------------------
+# The webhook listener accepts trades and opens paper positions; the process
+# needs no privileges beyond its own working tree, so it gets none. Without
+# these a webhook payload bug is a root-level host compromise.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Only the working tree is writable (log, SQLite db, WAL).
+ReadWritePaths=%h/Roni_workspace/crypto_shit_exploder/data
+ReadWritePaths=%h/Roni_workspace/crypto_shit_exploder/logs
+
 [Install]
 WantedBy=default.target
