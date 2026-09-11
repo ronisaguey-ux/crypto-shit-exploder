@@ -2,6 +2,7 @@
 from .base import Provider, ProviderError
 from .birdeye import BirdeyeProvider
 from .helius import HeliusProvider
+from .keyless import KeylessProvider
 from .solanatracker import SolanaTrackerProvider
 from .vybe import VybeProvider
 
@@ -12,6 +13,7 @@ __all__ = [
     "VybeProvider",
     "BirdeyeProvider",
     "HeliusProvider",
+    "KeylessProvider",
     "get_provider",
 ]
 
@@ -20,6 +22,7 @@ _REGISTRY = {
     "vybe": VybeProvider,
     "birdeye": BirdeyeProvider,
     "helius": HeliusProvider,
+    "keyless": KeylessProvider,
 }
 
 

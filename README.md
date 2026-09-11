@@ -82,8 +82,8 @@ has to carry the whole load.
 
 | Layer | Source | Limit | Notes |
 | --- | --- | --- | --- |
-| Live watch | `logsSubscribe` over WebSocket | 1 address per subscription | Helius free = 5 conns x 1,000 subs = exactly 5,000 wallets |
-| Transaction fetch | keyless RPC pool | measured **5.7 fetches/s** | `api.mainnet-beta.solana.com` + two PublicNode hosts |
+| Live watch | `logsSubscribe` over WebSocket | 1 address per subscription | keyless ≈ 100 subs/conn; Helius free = 5 conns x 1,000 subs = exactly 5,000 wallets |
+| Transaction fetch | keyless RPC pool | measured **5.7 fetches/s** (2026-09-10) | `api.mainnet-beta.solana.com` + two PublicNode hosts |
 | Prices | DexScreener | no key, ~300 req/min, 30 mints/call | returns pool liquidity too |
 | Prices (fallback) | GeckoTerminal | no key, ~30 req/min | used when DexScreener has no pair |
 | Swap parsing | this repo | free | balance-delta decoding, no per-DEX parser |
@@ -92,8 +92,10 @@ has to carry the whole load.
 ### The one real constraint: fetch throughput
 
 Watching is cheap; **fetching each transaction is not**. Measured on the keyless
-pool: **200/200 fetches succeeded at 5.70/s, 0 failures** — about **492,000
-transactions/day**.
+pool on 2026-09-10: **200/200 fetches succeeded at 5.70/s, 0 failures** — about
+**492,000 transactions/day**. That number is a dated one-off, not a promise; the
+public endpoints rate-limit per method and change without notice. Reproduce it
+with `tools/cse_watch_live.py` (a ~75 s live run).
 
 That sets the wallet ceiling for "paper-trade every single trade":
 
@@ -105,7 +107,10 @@ That sets the wallet ceiling for "paper-trade every single trade":
 | 100 | ~4,900 |
 | 500 | ~980 |
 
-So **5,000 real traders trading up to ~100 swaps/day each fits the free budget**.
+So **5,000 real traders trading up to ~100 swaps/day each fits the free fetch budget**
+— but only if you have a Helius key. Without one the keyless websocket tier carries
+roughly 400 wallets (`ws.capacity()` reports the exact figure), so `cse run --target 5000`
+will watch ~400 and silently leave the rest unwatched (one warning line, then nothing).
 Bot-grade wallets (500+ swaps/day, e.g. MEV searchers) do not — 5,000 of those
 would need ~2.5M fetches/day. Discovery targets traders, not searchers, so this
 is usually a non-issue, but it is the number that decides your pool size.

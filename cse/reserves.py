@@ -56,10 +56,13 @@ DEX_FEE_BPS: dict[str, float] = {
 _CP_VENUES = {
     "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
     "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
-    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
     "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
     "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",
 }
+# pump.fun (6EF8rre...) is deliberately NOT here. Its bonding curve does not hold
+# a plain two-vault x*y=k pair, so ``_market_side`` picks up an unrelated WSOL
+# account and the result was labelled "exact constant_product". It now falls
+# through to the empirical/estimate path, which is the honest label.
 
 DEX_NAMES = {
     "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": "raydium_amm",
@@ -121,6 +124,9 @@ class PoolState:
     liquidity_usd: float = 0.0
     #: Marginal price at the post-trade reserves, quote per base.
     mid_price: float = 0.0
+    #: USD value of one quote unit, so a quote-denominated mid can be compared
+    #: against a USD executed price. 1.0 for stables, sol_price_usd for SOL.
+    quote_usd_price: float = 1.0
     model: str = "unknown"      # constant_product | empirical | unknown
     confidence: str = "none"    # exact | estimate | none
     dex: Optional[str] = None
@@ -290,6 +296,9 @@ def extract_pool_state(
     depth = _quote_usd(quote_mint, reserve_quote, sol_price_usd)
     state.quote_depth_usd = depth
     state.liquidity_usd = depth * 2.0  # balanced pool: both sides are worth the same
+    # One quote unit in USD. The mid below is quote-per-base, so comparing it to
+    # a USD executed price needs this conversion or the result is meaningless.
+    state.quote_usd_price = (depth / reserve_quote) if reserve_quote else 1.0
 
     if program_id in _CP_VENUES:
         state.model = "constant_product"
@@ -375,10 +384,16 @@ def observed_slippage_bps(
     """
     if not pool.usable or executed_price <= 0 or pool.mid_price <= 0:
         return None
+    # ``mid_price`` is quote-per-base; ``executed_price`` is USD-per-base. Convert
+    # the mid to USD first, or this compares two different units and returns a
+    # meaningless ~1.36e6 bps for every non-constant-product venue.
+    mid_usd = pool.mid_price * pool.quote_usd_price
+    if mid_usd <= 0:
+        return None
     if side_is_buy:
         # Bought above the mid = paid the impact.
-        return max(0.0, (executed_price / pool.mid_price - 1.0) * 10_000.0)
-    return max(0.0, (1.0 - executed_price / pool.mid_price) * 10_000.0)
+        return max(0.0, (executed_price / mid_usd - 1.0) * 10_000.0)
+    return max(0.0, (1.0 - executed_price / mid_usd) * 10_000.0)
 
 
 # ------------------------------------------------------------------------ MEV

@@ -1,49 +1,39 @@
-"""Seed a scratch DB with real active trader wallets pulled from live mainnet."""
+"""Seed the pool with real active trader wallets pulled from live mainnet.
+
+Keyless: reads fee-payers of recent Jupiter swaps over the free RPC pool and
+writes them to the configured database (CSE_DB_PATH, else config db_path).
+
+The same logic is available as the ``keyless`` discovery provider, so
+``python -m cse discover`` populates the pool without running this script. This
+exists as a standalone for seeding a specific target without a full discovery.
+"""
 import asyncio
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from cse.config import load_config
 from cse.db import Database
 from cse.models import Trader
-from cse.rpc import RpcPool, default_endpoints
+from cse.providers.keyless import KeylessProvider
 
 JUPITER_V6 = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
-DB = "/tmp/cse_watch_test.db"
-
-
-def fee_payer(tx: dict) -> str:
-    keys = ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []
-    if not keys:
-        return ""
-    k = keys[0]
-    return k.get("pubkey", "") if isinstance(k, dict) else str(k)
 
 
 async def main():
-    pool = RpcPool(default_endpoints(), timeout=30, max_attempts=8)
-    rows = await pool.get_signatures_for_address(JUPITER_V6, limit=80)
-    sigs = [r["signature"] for r in rows]
-    wallets = set()
-    for sig in sigs:
-        try:
-            tx = await pool.get_transaction(sig)
-        except Exception:
-            continue
-        if not tx:
-            continue
-        w = fee_payer(tx)
-        if w:
-            wallets.add(w)
-        if len(wallets) >= 60:
-            break
-
-    db = Database(DB)
-    for w in wallets:
-        db.upsert_trader(Trader(address=w, source="live-seed"))
-    print(f"seeded {len(wallets)} wallets; db_total={db.count_traders()}")
+    cfg = load_config()
+    limit = int(sys.argv[1]) if len(sys.argv) > 1 else 60
+    provider = KeylessProvider(max_wallets=limit)
+    traders = await provider.top_traders(limit=limit)
+    if not traders:
+        print("seeded 0 wallets; the RPC pool returned nothing (try again)")
+        return
+    db = Database(cfg.db_path)
+    for t in traders:
+        db.upsert_trader(Trader(address=t.address, source="keyless-seed"))
+    print(f"seeded {len(traders)} wallets; db_total={db.count_traders()}")
     db.close()
-    await pool.aclose()
 
 
 asyncio.run(main())

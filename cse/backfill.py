@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS backfill_state (
     last_slot     INTEGER,
     last_polled_at REAL,
     sweeps        INTEGER NOT NULL DEFAULT 0,
-    enqueued      INTEGER NOT NULL DEFAULT 0
+    enqueued      INTEGER NOT NULL DEFAULT 0,
+    gap_before    TEXT
 );
 """
 
@@ -52,6 +53,7 @@ class BackfillStats:
     scanned: int = 0
     enqueued: int = 0
     gaps_closed: int = 0
+    gaps_pending: int = 0
     errors: int = 0
     elapsed_s: float = 0.0
     error_kinds: dict[str, int] = field(default_factory=dict)
@@ -122,6 +124,22 @@ class Backfiller:
             )
             self._conn.commit()
 
+    def _set_gap(self, wallet: str, gap_before: Optional[str]) -> None:
+        """Persist (or clear) the continuation for a gap that outran one sweep."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE backfill_state SET gap_before=? WHERE wallet=?",
+                (gap_before, wallet),
+            )
+            self._conn.commit()
+
+    def _gap(self, wallet: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT gap_before FROM backfill_state WHERE wallet=?", (wallet,)
+            ).fetchone()
+        return row["gap_before"] if row else None
+
     # ------------------------------------------------------------------ polling
     async def poll_wallet(self, wallet: str, stats: BackfillStats) -> int:
         """Queue every signature this wallet produced since the last sweep."""
@@ -131,6 +149,8 @@ class Backfiller:
         added = 0
         before: Optional[str] = None
         pages = 0
+        reached_cursor = False
+        page: list = []
 
         while pages < MAX_GAP_PAGES:
             try:
@@ -190,7 +210,23 @@ class Backfiller:
             stats.gaps_closed += 1
             before = page[-1].get("signature")
 
+        # The head cursor always advances to the newest signature we saw — that is
+        # the point of a cursor, and it is what the next sweep pages back from.
+        #
+        # The gap itself is NOT lost: when we ran out of pages before reaching the
+        # cursor, the deepest signature we reached is persisted as a continuation,
+        # and the next sweep resumes from there instead of skipping the unfetched
+        # pages forever.
         self._set_cursor(wallet, newest_sig, newest_slot, added)
+        if not (reached_cursor or len(page) < self.page_limit):
+            stats.gaps_pending += 1
+            self._set_gap(wallet, page[-1].get("signature"))
+            log.debug(
+                "backfill %s: gap still open after %d pages; continuation saved",
+                wallet[:8], pages,
+            )
+        else:
+            self._set_gap(wallet, None)
         return added
 
     async def run_once(self, wallets: Iterable[str]) -> BackfillStats:

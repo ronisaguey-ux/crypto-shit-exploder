@@ -46,14 +46,6 @@ CREATE TABLE IF NOT EXISTS trades (
     execution_json TEXT,
     kind TEXT NOT NULL DEFAULT 'observed'
 );
-CREATE INDEX IF NOT EXISTS idx_trades_trader ON trades(trader);
-CREATE INDEX IF NOT EXISTS idx_trades_mint ON trades(mint);
--- One observed trade is one row, however many times we see it (websocket, then
--- backfill). ``kind`` keeps the shadow fill of that same trade — which shares the
--- signature by design — from colliding with it. Partial index so simulated trades
--- carrying no signature are still free to repeat.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_unique_kind
-    ON trades(signature, trader, mint, kind) WHERE signature IS NOT NULL;
 CREATE TABLE IF NOT EXISTS positions (
     id TEXT PRIMARY KEY,
     trader TEXT,
@@ -64,7 +56,6 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_slippage_bps REAL,
     opened_at REAL
 );
-CREATE INDEX IF NOT EXISTS idx_positions_trader ON positions(trader);
 CREATE TABLE IF NOT EXISTS closed_trades (
     trader TEXT,
     mint TEXT,
@@ -78,7 +69,6 @@ CREATE TABLE IF NOT EXISTS closed_trades (
     opened_at REAL,
     closed_at REAL
 );
-CREATE INDEX IF NOT EXISTS idx_closed_trader ON closed_trades(trader);
 CREATE TABLE IF NOT EXISTS signals (
     id TEXT PRIMARY KEY,
     trader TEXT,
@@ -88,11 +78,29 @@ CREATE TABLE IF NOT EXISTS signals (
     fitness REAL,
     created_at REAL
 );
-CREATE INDEX IF NOT EXISTS idx_signals_mint ON signals(mint);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+"""
+
+#: Indexes are created only after ``_migrate()`` has added the columns they
+#: reference. ``idx_trades_unique_kind`` names the ``kind`` column, which does
+#: not exist in a database written by an older collector — creating it inside
+#: SCHEMA made opening such a database raise ``no such column: kind`` before the
+#: migration could add it.
+SCHEMA_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_trades_trader ON trades(trader);
+CREATE INDEX IF NOT EXISTS idx_trades_mint ON trades(mint);
+-- One observed trade is one row, however many times we see it (websocket, then
+-- backfill). ``kind`` keeps the shadow fill of that same trade — which shares the
+-- signature by design — from colliding with it. Partial index so simulated trades
+-- carrying no signature are still free to repeat.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_unique_kind
+    ON trades(signature, trader, mint, kind) WHERE signature IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_positions_trader ON positions(trader);
+CREATE INDEX IF NOT EXISTS idx_closed_trader ON closed_trades(trader);
+CREATE INDEX IF NOT EXISTS idx_signals_mint ON signals(mint);
 """
 
 
@@ -112,6 +120,9 @@ class Database:
         self._conn.execute("PRAGMA wal_autocheckpoint=1000")
         self._conn.executescript(SCHEMA)
         self._migrate()
+        # Indexes last: idx_trades_unique_kind names ``kind``, which only exists
+        # once _migrate() has added it to an older database.
+        self._conn.executescript(SCHEMA_INDEXES)
         self._conn.commit()
 
     #: Columns added to ``trades`` after the first release. ``CREATE TABLE IF NOT
@@ -225,9 +236,16 @@ class Database:
             self._conn.commit()
             return cur.rowcount > 0
 
-    def recent_trades(self, limit: int = 100) -> list[Trade]:
+    def recent_trades(self, limit: int = 100, kind: str = "observed") -> list[Trade]:
+        """Stored trades, newest first, filtered to ``kind``.
+
+        ``cse simulate`` replays what the trader actually did; without the filter
+        it also replayed the shadow fills those replays wrote back, so every run
+        doubled the positions and closed trades.
+        """
         rows = self._conn.execute(
-            "SELECT * FROM trades ORDER BY observed_at DESC LIMIT ?", (limit,)
+            "SELECT * FROM trades WHERE kind = ? ORDER BY observed_at DESC LIMIT ?",
+            (kind, limit),
         ).fetchall()
         return [self._trade_from_row(dict(r)) for r in rows]
 

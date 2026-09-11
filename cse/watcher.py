@@ -84,6 +84,7 @@ class WatchStats:
     not_found: int = 0
     fetch_errors: int = 0
     decoded: int = 0
+    decode_errors: int = 0
     trades: int = 0
     duplicates: int = 0
     closed: int = 0
@@ -101,6 +102,7 @@ class WatchStats:
             "not_found": self.not_found,
             "fetch_errors": self.fetch_errors,
             "decoded": self.decoded,
+            "decode_errors": self.decode_errors,
             "trades": self.trades,
             "duplicates": self.duplicates,
             "closed": self.closed,
@@ -223,29 +225,41 @@ class Watcher:
 
         self.stats.fetched += 1
         wanted = [wallet] if wallet else None
-        trades = decode_trades(
-            tx, wallets=wanted, sol_price_usd=self.cfg.paper.sol_price_usd
-        )
-        if not trades:
+        try:
+            trades = decode_trades(
+                tx, wallets=wanted, sol_price_usd=self.cfg.paper.sol_price_usd
+            )
+            if not trades:
+                if self.queue is not None:
+                    self.queue.mark_done(signature)
+                return
+            self.stats.decoded += len(trades)
+
+            if self.enrich:
+                for t in trades:
+                    try:
+                        enrich_trade(
+                            tx,
+                            t,
+                            wallets=wanted,
+                            sol_price_usd=self.cfg.paper.sol_price_usd,
+                        )
+                    except Exception as e:  # noqa: BLE001 - enrichment is additive
+                        log.debug("enrich failed for %s: %s", signature[:12], e)
+
+            await self._price(trades)
+            self._record(trades)
+        except Exception as e:  # noqa: BLE001
+            # A malformed transaction (bad fields, unexpected shape) used to
+            # propagate out of here with the queue row never settled, so the
+            # watcher re-fetched the same signature on every drain forever.
+            # mark_failed puts it into backoff: a transient bad node reply is
+            # retried, a permanently broken row eventually stops being claimed.
+            self.stats.decode_errors += 1
+            log.warning("decode failed for %s: %s", signature[:12], e)
             if self.queue is not None:
-                self.queue.mark_done(signature)
+                self.queue.mark_failed(signature, f"decode error: {type(e).__name__}")
             return
-        self.stats.decoded += len(trades)
-
-        if self.enrich:
-            for t in trades:
-                try:
-                    enrich_trade(
-                        tx,
-                        t,
-                        wallets=wanted,
-                        sol_price_usd=self.cfg.paper.sol_price_usd,
-                    )
-                except Exception as e:  # noqa: BLE001 - enrichment is additive
-                    log.debug("enrich failed for %s: %s", signature[:12], e)
-
-        await self._price(trades)
-        self._record(trades)
         if self.queue is not None:
             self.queue.mark_done(signature)
 
