@@ -163,6 +163,83 @@ class DrawdownGuard:
 
 
 @dataclass
+class CircuitBreaker:
+    """Trips on excessive ingest error rate or drawdown from peak.
+
+    Ported from oculus's live_risk_manager.CircuitBreaker (docs/OCULUS_PORTS.md
+    item 2). The watcher already counts fetch_errors and decode_errors; nothing
+    watched them, so a node that had started rejecting every call looked exactly
+    like a quiet market. Once tripped it stays tripped until reset — the point is
+    to stop, not to oscillate.
+    """
+
+    max_drawdown_pct: float = 0.10
+    max_error_rate: float = 0.5
+    window_size: int = 100
+
+    def __post_init__(self) -> None:
+        if not 0 < self.max_drawdown_pct < 1:
+            raise ValueError("max_drawdown_pct must be in (0, 1)")
+        if not 0 < self.max_error_rate <= 1:
+            raise ValueError("max_error_rate must be in (0, 1]")
+        if self.window_size <= 0:
+            raise ValueError("window_size must be positive")
+        self._peak_equity = 0.0
+        self._error_count = 0
+        self._total_count = 0
+        self._tripped = False
+        self._trip_reason = ""
+
+    @property
+    def tripped(self) -> bool:
+        return self._tripped
+
+    @property
+    def trip_reason(self) -> str:
+        return self._trip_reason
+
+    def _trip(self, reason: str) -> None:
+        self._tripped = True
+        self._trip_reason = reason
+
+    def update_equity(self, equity: float) -> None:
+        if self._tripped:
+            return
+        if equity > self._peak_equity:
+            self._peak_equity = equity
+        if self._peak_equity > 0:
+            dd = (self._peak_equity - equity) / self._peak_equity
+            if dd >= self.max_drawdown_pct:
+                self._trip(f"drawdown {dd:.2%} >= {self.max_drawdown_pct:.2%}")
+
+    def record_error(self) -> None:
+        if self._tripped:
+            return
+        self._error_count += 1
+        self._total_count += 1
+        if self._total_count >= self.window_size:
+            rate = self._error_count / self._total_count
+            if rate >= self.max_error_rate:
+                self._trip(f"error rate {rate:.2%} >= {self.max_error_rate:.2%}")
+
+    def record_success(self) -> None:
+        if self._tripped:
+            return
+        self._total_count += 1
+
+    def reset(self) -> None:
+        self.__post_init__()
+
+    def to_dict(self) -> dict:
+        return {
+            "tripped": self._tripped,
+            "reason": self._trip_reason,
+            "errors": self._error_count,
+            "total": self._total_count,
+        }
+
+
+@dataclass
 class HealthReport:
     """What the runner reports about itself, so silence is never the only signal."""
 
