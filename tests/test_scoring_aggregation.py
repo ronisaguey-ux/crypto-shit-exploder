@@ -219,3 +219,60 @@ def test_filter_tracked():
     b = Trade(trader="b", mint="m", side=Side.BUY, price=1.0, amount=1.0)
     assert filter_tracked([a, b], {"a"}) == [a]
     assert filter_tracked([a, b], set()) == [a, b]
+
+
+# ── exact composite fitness (F-004: the mutation this must kill) ────────────
+# The audit found that changing the composite formula's weights or dropping a
+# component left the suite green. This pins the arithmetic to the last digit, so
+# any mutation of the weights, the tanh scale or the annualization fails.
+
+def test_composite_fitness_matches_the_hand_computed_formula():
+    import math
+    from cse.config import ScoringConfig
+    from cse.models import ClosedTrade
+    from cse.scoring.fitness import score_traders
+
+    cfg = ScoringConfig()
+    # 20 trades (min_trades): a mix of wins and losses so every component has a
+    # real denominator (an all-win set leaves profit_factor's loss leg at zero).
+    pnls = [2.0, -1.0, 3.0, -0.5, 1.5, -2.0, 2.5, -1.5, 1.0, -0.5,
+            2.0, -1.0, 3.0, -0.5, 1.5, -2.0, 2.5, -1.5, 1.0, -0.5]
+    trades = []
+    for i, pnl in enumerate(pnls):
+        trades.append(ClosedTrade(
+            trader="w1", mint=f"m{i}", entry_price=1.0, exit_price=1.0 + pnl / 10.0,
+            amount=10.0, pnl_usd=pnl, pnl_pct=pnl / 10.0, fees_usd=0.0,
+            hold_seconds=60.0, opened_at=0.0, closed_at=float(i),
+        ))
+    rep = score_traders({"w1": trades}, cfg, starting_equity=10_000)[0]
+
+    returns = [t.pnl_usd / (t.amount * t.entry_price) for t in trades]
+    n = len(returns)
+    avg = sum(returns) / n
+    var = sum((r - avg) ** 2 for r in returns) / (n - 1)
+    std = math.sqrt(var)
+    downside = [r for r in returns if r < 0]
+    win_rate = sum(1 for r in returns if r > 0) / n
+    gains = sum(r for r in returns if r > 0)
+    losses = -sum(r for r in returns if r < 0)
+    profit_factor = gains / losses
+
+    ann = math.sqrt(max(cfg.annualization, 1.0))
+    sharpe = (avg / std) * ann
+    sortino = (avg / (math.sqrt(sum((r - 0) ** 2 for r in downside) / (len(downside) - 1))) * ann) if len(downside) > 1 else (10.0 if avg > 0 else 0.0)
+    s = cfg.tanh_scale
+    comp = {
+        "sharpe": 0.5 * (1 + math.tanh(sharpe / s)),
+        "sortino": 0.5 * (1 + math.tanh(sortino / s)),
+        "win_rate": win_rate,
+        "profit_factor": 0.5 * (1 + math.tanh((profit_factor - 1.0) / s)),
+        "max_drawdown": 1.0 - rep.max_drawdown_pct,
+    }
+    w = cfg.weights
+    total_w = sum(w[k] for k in comp)
+    expected = sum(comp[k] * w[k] for k in comp) / total_w
+
+    assert rep.fitness == pytest.approx(expected, abs=1e-9)
+    # and the components themselves, so a swapped weight is caught too
+    for k in comp:
+        assert rep.components[k] == pytest.approx(comp[k], abs=1e-9)

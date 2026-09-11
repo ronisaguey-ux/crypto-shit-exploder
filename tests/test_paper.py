@@ -147,10 +147,17 @@ def test_max_drawdown_is_recorded(tmp_path):
 
 
 def test_latency_makes_entry_worse(tmp_path):
-    eng, cfg = _engine(tmp_path, latency_seconds=5.0)
-    # Latency applies adverse drift, so the simulated fill is above the observed price.
-    eff, _, _, _ = eng.simulate_fill(Side.BUY, price=1.0, amount=100)
-    assert eff > 1.0
+    """F-022: this used to call simulate_fill with latency_seconds set but never
+    assert that latency was the cause — any slippage at all passed it. Compare
+    the resulting ENTRY PRICE with latency off and on, so a mutation that drops
+    the latency term from on_trade fails here."""
+    off, _ = _engine(tmp_path, latency_seconds=0.0)
+    on, _ = _engine(tmp_path, latency_seconds=5.0)
+    off.on_trade(Trade(trader="w1", mint="m1", side=Side.BUY, price=1.0, amount=100))
+    on.on_trade(Trade(trader="w2", mint="m1", side=Side.BUY, price=1.0, amount=100))
+    # Both spend the same budget, so the tell is the entry price: the latency
+    # model fills higher, buying fewer tokens for the same cash.
+    assert on.db.get_position("w2", "m1").entry_price > off.db.get_position("w1", "m1").entry_price
 
 
 def test_summary_sorted_by_equity(tmp_path):
@@ -161,3 +168,74 @@ def test_summary_sorted_by_equity(tmp_path):
     eng.on_trade(Trade(trader="w2", mint="m1", side=Side.SELL, price=0.5, amount=1000))
     s = eng.summary()
     assert s[0]["trader"] == "w1"
+
+
+# ── exact-value accounting (F-004: the mutations these must kill) ──────────
+# Every assertion below pins an exact number rather than a direction, so zeroing
+# the MEV tax, flipping the latency sign, dropping an exit cost or changing the
+# composite formula all fail the suite instead of passing silently.
+
+def test_latency_is_adverse_on_both_sides(tmp_path):
+    """A mutation that applies the drift with one sign must fail here."""
+    eng, cfg = _engine(tmp_path, latency_seconds=5.0)
+    buy = eng._apply_latency(1.0, Side.BUY)
+    sell = eng._apply_latency(1.0, Side.SELL)
+    # 5s * 2bps/s = 10 bps = 0.001
+    assert buy == pytest.approx(1.001)
+    assert sell == pytest.approx(0.999)
+    assert buy > 1.0 > sell
+
+
+def test_latency_is_a_noop_at_zero(tmp_path):
+    eng, cfg = _engine(tmp_path, latency_seconds=0.0)
+    assert eng._apply_latency(1.0, Side.BUY) == 1.0
+    assert eng._apply_latency(1.0, Side.SELL) == 1.0
+
+
+def test_mev_tax_is_charged_and_scales_with_notional(tmp_path):
+    """Zeroing mev_tax_bps must change the fill; 25 bps of notional is exact."""
+    eng, cfg = _engine(tmp_path, mev_tax_bps=25, slippage_bps=0, dynamic_slippage=False)
+    _, _, _, mev = eng.simulate_fill(Side.BUY, price=1.0, amount=10_000)
+    assert mev == pytest.approx(10_000 * 25 / 10_000.0)  # 25 USD
+    _, _, _, mev2 = eng.simulate_fill(Side.BUY, price=1.0, amount=1_000)
+    assert mev2 == pytest.approx(mev / 10.0)
+
+
+def test_mev_tax_is_zero_when_configured_off(tmp_path):
+    eng, cfg = _engine(tmp_path, mev_tax_bps=0, slippage_bps=0, dynamic_slippage=False)
+    _, _, _, mev = eng.simulate_fill(Side.BUY, price=1.0, amount=10_000)
+    assert mev == 0.0
+
+
+def test_round_trip_pnl_is_exact_with_known_costs(tmp_path):
+    """entry 1.0 -> exit 2.0, 100 bps slip, no fee/mev/latency.
+
+    The engine sizes by BUDGET (position_pct * equity), not by the observed
+    amount: budget = 10000 * 0.10 = 1000 USD. At an effective entry of 1.01 that
+    buys 1000/1.01 units, which exit at 1.98 -> 960.396 USD, so PnL is
+    960.396 - 1000 = -39.60.
+    """
+    eng, cfg = _engine(tmp_path, slippage_bps=100, dynamic_slippage=False,
+                       slippage_jitter=[1.0, 1.0], mev_tax_bps=0, latency_seconds=0.0,
+                       base_fee_lamports=0, priority_fee_lamports=0)
+    eng.on_trade(Trade(trader="w1", mint="m1", side=Side.BUY, price=1.0, amount=1000))
+    closed = eng.on_trade(Trade(trader="w1", mint="m1", side=Side.SELL, price=2.0, amount=1000))
+    units = 1000.0 / 1.01
+    assert closed.entry_price == pytest.approx(1.01)
+    assert closed.exit_price == pytest.approx(1.98)
+    assert closed.amount == pytest.approx(units)
+    assert closed.pnl_usd == pytest.approx(units * 1.98 - 1000.0)
+
+
+def test_exit_costs_are_subtracted_from_proceeds(tmp_path):
+    """Dropping the exit fee from the PnL formula must fail this."""
+    eng, cfg = _engine(tmp_path, slippage_bps=0, dynamic_slippage=False,
+                       slippage_jitter=[1.0, 1.0], mev_tax_bps=0, latency_seconds=0.0,
+                       base_fee_lamports=5000, priority_fee_lamports=50_000)
+    eng.on_trade(Trade(trader="w1", mint="m1", side=Side.BUY, price=1.0, amount=1000))
+    closed = eng.on_trade(Trade(trader="w1", mint="m1", side=Side.SELL, price=1.0, amount=1000))
+    fee = (5000 + 50_000) / 1e9 * 150.0          # 0.00825 USD per tx
+    assert closed is not None
+    # flat price, so the only thing that can make PnL non-zero is the fees
+    assert closed.pnl_usd == pytest.approx(-2 * fee)
+    assert eng.portfolio("w1").fees_paid_usd == pytest.approx(2 * fee)

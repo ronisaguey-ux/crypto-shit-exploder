@@ -18,6 +18,8 @@ import asyncio
 import json
 import time
 
+import pytest
+
 from cse.backfill import Backfiller
 from cse.db import Database
 from cse.models import Side, Trade
@@ -339,3 +341,76 @@ def test_signal_restore_is_safe_to_call_twice():
         restore()  # must not raise
 
     asyncio.run(scenario())
+
+
+# ── migration, malformed tx, restart equity (F-004) ─────────────────────────
+
+def test_database_opens_a_pre_kind_schema(tmp_path):
+    """B-04: SCHEMA used to create idx_trades_unique_kind before _migrate()
+    added the column, so opening an older collector's DB raised
+    `no such column: kind` and the process could not start."""
+    import sqlite3
+    p = tmp_path / "old.db"
+    c = sqlite3.connect(p)
+    c.executescript("""
+        CREATE TABLE trades (id TEXT PRIMARY KEY, trader TEXT, mint TEXT, side TEXT,
+            price REAL, amount REAL, signature TEXT, slot INTEGER,
+            pool_liquidity_usd REAL, observed_at REAL, effective_price REAL,
+            fees_usd REAL, slippage_bps REAL, mev_tax_usd REAL);
+        CREATE UNIQUE INDEX idx_trades_unique ON trades(signature, trader, mint);
+    """)
+    c.commit(); c.close()
+
+    db = Database(p)                      # must not raise
+    cols = {r["name"] for r in db._conn.execute("PRAGMA table_info(trades)")}
+    assert "kind" in cols
+    idx = {r["name"] for r in db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'")}
+    assert "idx_trades_unique_kind" in idx
+    assert "idx_trades_unique" not in idx   # superseded index dropped
+    db.close()
+
+
+def test_malformed_transaction_is_settled_not_left_pending(tmp_path):
+    """F-010: decode_trades raising used to leave the queue row unclaimed
+    forever, so the watcher re-fetched the same signature on every drain."""
+    from cse.queue import FetchQueue
+    q = FetchQueue(tmp_path / "q.db")
+    q.enqueue_many([("bad-sig", WALLET, 1)])
+    assert len(q.claim(10)) == 1
+    q.mark_failed("bad-sig", "decode error: ValueError")
+    # It must not be immediately claimable again: backoff holds it.
+    assert len(q.claim(10)) == 0
+    q.close()
+
+
+def test_portfolio_equity_survives_a_restart(tmp_path):
+    """F-008: equity reset to starting_equity while open positions persisted, so
+    a flat close after a restart booked a phantom gain."""
+    from cse.config import PaperConfig
+    from cse.paper import PaperTradingEngine
+
+    path = tmp_path / "eq.db"
+    cfg = PaperConfig(starting_equity_usd=10_000, position_pct=0.10,
+                      slippage_bps=0, dynamic_slippage=False, slippage_jitter=[1.0, 1.0],
+                      mev_tax_bps=0, latency_seconds=0.0,
+                      base_fee_lamports=0, priority_fee_lamports=0)
+
+    db1 = Database(path)
+    eng1 = PaperTradingEngine(cfg, db1)
+    eng1.on_trade(_trade(sig="b1"))                       # open a position
+    equity_before = eng1.portfolio(WALLET).equity_usd
+    assert equity_before < 10_000                          # cash went into the position
+    db1.close()
+
+    # Reopen: the engine is new but the position and the equity must both persist.
+    db2 = Database(path)
+    eng2 = PaperTradingEngine(cfg, db2)
+    assert eng2.portfolio(WALLET).equity_usd == pytest.approx(equity_before)
+    closed = eng2.on_trade(Trade(trader=WALLET, mint=MINT, side=Side.SELL,
+                                 price=1e-4, amount=1_000.0, signature="s1", slot=101,
+                                 observed_at=200.0))
+    assert closed is not None
+    # A flat round trip (same price, no fees) must not manufacture a gain.
+    assert closed.pnl_usd == pytest.approx(0.0, abs=1e-9)
+    db2.close()

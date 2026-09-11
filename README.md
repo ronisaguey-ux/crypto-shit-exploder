@@ -83,7 +83,7 @@ has to carry the whole load.
 | Layer | Source | Limit | Notes |
 | --- | --- | --- | --- |
 | Live watch | `logsSubscribe` over WebSocket | 1 address per subscription | keyless ≈ 100 subs/conn; Helius free = 5 conns x 1,000 subs = exactly 5,000 wallets |
-| Transaction fetch | keyless RPC pool | measured **5.7 fetches/s** | `api.mainnet-beta.solana.com` + two PublicNode hosts |
+| Transaction fetch | keyless RPC pool | measured **5.7 fetches/s** (2026-09-10) | `api.mainnet-beta.solana.com` + two PublicNode hosts |
 | Prices | DexScreener | no key, ~300 req/min, 30 mints/call | returns pool liquidity too |
 | Prices (fallback) | GeckoTerminal | no key, ~30 req/min | used when DexScreener has no pair |
 | Swap parsing | this repo | free | balance-delta decoding, no per-DEX parser |
@@ -92,8 +92,10 @@ has to carry the whole load.
 ### The one real constraint: fetch throughput
 
 Watching is cheap; **fetching each transaction is not**. Measured on the keyless
-pool: **200/200 fetches succeeded at 5.70/s, 0 failures** — about **492,000
-transactions/day**.
+pool on 2026-09-10: **200/200 fetches succeeded at 5.70/s, 0 failures** — about
+**492,000 transactions/day**. That number is a dated one-off, not a promise; the
+public endpoints rate-limit per method and change without notice. Reproduce it
+with `tools/cse_watch_live.py` (a ~75 s live run).
 
 That sets the wallet ceiling for "paper-trade every single trade":
 

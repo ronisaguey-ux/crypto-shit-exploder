@@ -231,6 +231,7 @@ class PaperTradingEngine:
         # equity never double-counts the tokens (slippage is already in eff_price).
         port.equity_usd -= cost
         port.fees_paid_usd += fee + mev
+        self._persist_portfolio(port)
         self.db.insert_trade(_simulated(trade, eff_price, slip_bps, fee, mev))
         return None
 

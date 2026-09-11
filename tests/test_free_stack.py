@@ -356,3 +356,42 @@ async def test_watcher_ignores_unparseable_transaction(tmp_path):
     assert queue.stats()["done"] == 1
     queue.close()
     db.close()
+
+
+# ── insert_trade idempotency (F-004 / F-018) ────────────────────────────────
+# The audit found no test for the duplicate contract: a mutation that dropped
+# INSERT OR IGNORE, or that ignored `kind` in the unique index, survived.
+
+def test_insert_trade_is_idempotent_on_signature(tmp_path):
+    from cse.db import Database
+    from cse.models import Side, Trade
+
+    db = Database(tmp_path / "dup.db")
+    t = Trade(trader="w1", mint="m1", side=Side.BUY, price=1.0, amount=10.0,
+              signature="sig-1", slot=1, observed_at=1.0)
+    assert db.insert_trade(t) is True
+    assert db.insert_trade(t) is False          # same (sig, trader, mint, kind)
+    assert len(db.recent_trades(limit=10)) == 1
+
+    # A different kind on the same signature is NOT a duplicate: the shadow fill
+    # shares the signature by design and must be storable alongside the observed one.
+    sim = Trade(trader="w1", mint="m1", side=Side.BUY, price=1.01, amount=10.0,
+                signature="sig-1", slot=1, observed_at=1.0, kind="simulated")
+    assert db.insert_trade(sim) is True
+    assert len(db.recent_trades(limit=10)) == 1          # observed view unchanged
+    assert len(db.recent_trades(limit=10, kind="simulated")) == 1
+    db.close()
+
+
+def test_signature_less_trades_are_not_deduped(tmp_path):
+    """The partial index excludes NULL signatures, so those rows may repeat."""
+    from cse.db import Database
+    from cse.models import Side, Trade
+
+    db = Database(tmp_path / "nosig.db")
+    a = Trade(trader="w1", mint="m1", side=Side.BUY, price=1.0, amount=10.0, observed_at=1.0)
+    b = Trade(trader="w1", mint="m1", side=Side.BUY, price=1.0, amount=10.0, observed_at=1.0)
+    assert db.insert_trade(a) is True
+    assert db.insert_trade(b) is True
+    assert len(db.recent_trades(limit=10)) == 2
+    db.close()
